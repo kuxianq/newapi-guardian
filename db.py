@@ -1,5 +1,7 @@
 """NewAPI Guardian Bot - MySQL 只读查询层"""
 import pymysql
+from decimal import Decimal
+from datetime import datetime, date, time, timedelta
 from contextlib import contextmanager
 from config import MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
 from cache import cache
@@ -19,11 +21,40 @@ def get_conn():
         conn.close()
 
 
+def _convert_for_json(obj):
+    """递归转换为 JSON 可序列化的类型"""
+    if obj is None:
+        return None
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, (datetime, date, time)):
+        return obj.isoformat()
+    if isinstance(obj, timedelta):
+        return obj.total_seconds()
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode('utf-8')
+        except UnicodeDecodeError:
+            return obj.hex()
+    if isinstance(obj, set):
+        return [_convert_for_json(item) for item in obj]
+    if isinstance(obj, dict):
+        return {k: _convert_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_convert_for_json(item) for item in obj]
+    return obj
+
+
+# 向后兼容：保留旧名称
+_convert_decimals = _convert_for_json
+
+
 def query(sql: str, args=None) -> list[dict]:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, args or ())
-            return cur.fetchall()
+            results = cur.fetchall()
+            return _convert_for_json(results)
 
 
 # ── 渠道相关 ──

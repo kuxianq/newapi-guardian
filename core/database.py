@@ -2,6 +2,7 @@
 import re
 import pymysql
 from decimal import Decimal
+from datetime import datetime, date, time, timedelta
 from contextlib import contextmanager
 from typing import Any
 from config import MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
@@ -27,15 +28,40 @@ def get_conn():
         conn.close()
 
 
-def _convert_decimals(obj):
-    """递归转换 Decimal 为 float，确保 JSON 可序列化"""
+def _convert_for_json(obj):
+    """递归转换为 JSON 可序列化的类型
+    
+    处理以下不可序列化的类型：
+    - Decimal → float
+    - datetime/date/time → ISO 格式字符串
+    - timedelta → 秒数
+    - bytes → 字符串（如果是 UTF-8）或十六进制
+    - set → list
+    """
+    if obj is None:
+        return None
     if isinstance(obj, Decimal):
         return float(obj)
-    elif isinstance(obj, dict):
-        return {k: _convert_decimals(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_convert_decimals(item) for item in obj]
+    if isinstance(obj, (datetime, date, time)):
+        return obj.isoformat()
+    if isinstance(obj, timedelta):
+        return obj.total_seconds()
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode('utf-8')
+        except UnicodeDecodeError:
+            return obj.hex()
+    if isinstance(obj, set):
+        return [_convert_for_json(item) for item in obj]
+    if isinstance(obj, dict):
+        return {k: _convert_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_convert_for_json(item) for item in obj]
     return obj
+
+
+# 向后兼容：保留旧名称
+_convert_decimals = _convert_for_json
 
 
 def query(sql: str, args=None) -> list[dict]:
@@ -44,7 +70,7 @@ def query(sql: str, args=None) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(sql, args or ())
             results = cur.fetchall()
-            return _convert_decimals(results)
+            return _convert_for_json(results)
 
 
 def is_safe_sql(sql: str) -> tuple[bool, str]:
@@ -138,7 +164,7 @@ def execute_readonly_sql(sql: str, params: dict = None, limit: int = 100) -> dic
                 
                 return {
                     "success": True,
-                    "data": results,
+                    "data": _convert_for_json(results),
                     "row_count": len(results),
                     "error": None,
                     "limited": limited

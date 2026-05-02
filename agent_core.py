@@ -9,6 +9,29 @@
 4. 学习能力（从对话中学习）
 """
 
+from decimal import Decimal
+from datetime import datetime, date, time, timedelta
+
+
+class _SafeJSONEncoder:
+    """兼容各种类型的 JSON 编码器帮手"""
+    @staticmethod
+    def default(obj):
+        if isinstance(obj, Decimal):
+            return float(obj)
+        if isinstance(obj, (datetime, date, time)):
+            return obj.isoformat()
+        if isinstance(obj, timedelta):
+            return obj.total_seconds()
+        if isinstance(obj, bytes):
+            try:
+                return obj.decode('utf-8')
+            except UnicodeDecodeError:
+                return obj.hex()
+        if isinstance(obj, set):
+            return list(obj)
+        raise TypeError(f'Object of type {obj.__class__.__name__} is not JSON serializable')
+
 import json
 import logging
 from pathlib import Path
@@ -50,7 +73,7 @@ class AgentMemory:
             "last_updated": datetime.now().isoformat()
         }
         self.memory_file.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
+            json.dumps(data, ensure_ascii=False, indent=2, default=_SafeJSONEncoder.default),
             encoding="utf-8"
         )
     
