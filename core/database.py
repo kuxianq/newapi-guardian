@@ -1,6 +1,7 @@
 """核心数据库层 - 通用只读查询能力"""
 import re
 import pymysql
+from decimal import Decimal
 from contextlib import contextmanager
 from typing import Any
 from config import MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
@@ -26,12 +27,24 @@ def get_conn():
         conn.close()
 
 
+def _convert_decimals(obj):
+    """递归转换 Decimal 为 float，确保 JSON 可序列化"""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    elif isinstance(obj, dict):
+        return {k: _convert_decimals(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_decimals(item) for item in obj]
+    return obj
+
+
 def query(sql: str, args=None) -> list[dict]:
     """基础查询函数"""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, args or ())
-            return cur.fetchall()
+            results = cur.fetchall()
+            return _convert_decimals(results)
 
 
 def is_safe_sql(sql: str) -> tuple[bool, str]:
