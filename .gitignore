@@ -1,42 +1,26 @@
-# 环境变量
-.env
-.env.local
-.env.*.local
-
-# 数据文件
-data/*.db
-data/ai_config.json
-data/agent_memory/
-backups/
-
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# 虚拟环境
-venv/
 .venv/
+venv/
 ENV/
-env/
+
+# 敏感信息
+.env
+*.env
+*.key
+*.pem
+credentials/
+
+# 运行数据
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
 
 # IDE
 .vscode/
@@ -44,9 +28,6 @@ env/
 *.swp
 *.swo
 *~
-
-# 日志
-*.log
 
 # OS
 .DS_Store

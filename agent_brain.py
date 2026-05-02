@@ -1,41 +1,38 @@
-# Agent AI 大脑 - 真正的智能对话引擎
-"""
-不再是简单的工具调用，而是：
-- 理解意图
-- 思考推理
-- 主动分析
-- 给出建议
-"""
+"""Guardian Agent 大脑 - 通用 Agent + NewAPI Skill"""
+from __future__ import annotations
 
 import json
 import logging
-import urllib.request
 import urllib.error
-from typing import Optional
+import urllib.request
+from typing import Any
 
-from agent_core import GuardianAgent, AgentMemory
+from agent_core import AgentMemory, GuardianAgent
 from ai_config import load_config
+from skills.newapi import DATABASE_SCHEMA
+from tools_new.executor import execute_tool
 
 logger = logging.getLogger("guardian.agent.brain")
 
 
-def build_agent_system_prompt(memory: AgentMemory) -> str:
-    """构建 Agent 的 [REDACTED] - 更自由、更智能"""
-    
+def build_agent_system_prompt(memory: AgentMemory, tools_schema: list[dict[str, Any]]) -> str:
+    """构建系统提示词：通用 Agent + NewAPI Skill。"""
     user_profile = memory.long_term["user_profile"]
-    learned_facts = memory.long_term["learned_facts"][-5:]  # 最近学到的 5 个事实
-    
-    prompt = f"""你是 NewAPI Guardian 的智能助手 Agent。
+    learned_facts = memory.long_term["learned_facts"][-5:]
 
-## 你的身份
-你不是一个冷冰冰的工具调用机器人，而是一个会思考、会分析、会给建议的智能助手。
+    tool_lines = []
+    for item in tools_schema:
+        fn = item.get("function", {})
+        if not fn:
+            continue
+        tool_lines.append(f"- {fn.get('name')}：{fn.get('description', '')}")
 
-## 你的能力
-1. **理解意图**：不要死板地匹配关键词，要理解用户真正想要什么
-2. **主动思考**：不只是返回数据，要分析、推理、给出洞察
-3. **记忆上下文**：记住之前的对话，不要每次都重新问
-4. **主动发现**：看到异常要主动提醒，不要等用户问
-5. **给出建议**：不只说"是什么"，还要说"为什么"和"怎么办"
+    return f"""你是一个通用运维 Agent，擅长分析、推理、总结，并能在必要时调用工具完成任务。
+
+## 角色定位
+- 你不是只会机械调用工具的机器人，而是会先理解用户目标，再决定是否查询数据或调用 API。
+- 你当前挂载了 NewAPI 运维 Skill，这是你的核心技能之一。
+- 你要充分利用上下文记忆，保持多轮对话连续性。
 
 ## 用户偏好
 - 报告风格：{user_profile.get('report_style', 'balanced')}
@@ -44,138 +41,62 @@ def build_agent_system_prompt(memory: AgentMemory) -> str:
 - 关注的渠道：{', '.join(map(str, user_profile.get('watched_channels', []))) or '暂无'}
 
 ## 你记住的事实
-{chr(10).join(f"- {fact['fact']}" for fact in learned_facts) if learned_facts else "（暂无）"}
+{chr(10).join(f"- {fact['fact']}" for fact in learned_facts) if learned_facts else '（暂无）'}
+
+## 当前挂载 Skill：NewAPI
+{DATABASE_SCHEMA}
 
 ## 可用工具
-你可以调用以下工具来获取数据和执行操作：
+{chr(10).join(tool_lines) if tool_lines else '（暂无工具）'}
+- remember_fact：记住长期有用的事实
+- update_user_preference：更新用户偏好
 
-### 查询类（safe - 随时可用）
-- get_overview: 查看最近 1 小时总览
-- get_channel_detail(channel_id): 查看渠道详情
-- get_channel_list: 查看所有渠道
-- get_failed_channels: 查看失败较多的渠道
-- get_slow_channels: 查看慢渠道
-- get_model_channels(model_name): 查看某模型的渠道
-- get_model_stats: 查看模型使用排行
-- get_today_stats: 查看今日统计
-- get_user_stats: 查看用户排行
-- get_token_stats: 查看 Token 排行
-- get_channel_health(channel_id): 查看渠道健康度
-
-### 测试类（safe - 随时可用）
-- test_channel(channel_id, model?): 测试单个渠道
-- test_channels_batch(channel_ids): 批量测试渠道
-- test_model_channels(model_name): 测试某模型的所有渠道
-
-### 操作类（部分需要确认）
-- enable_channel(channel_id): 启用渠道（safe）
-- disable_channel(channel_id): 禁用渠道（需要确认）
-- batch_enable(channel_ids): 批量启用（safe）
-- batch_disable(channel_ids): 批量禁用（需要确认）
-
-### 记忆类（safe - 随时可用）
-- remember_fact(fact, category): 记住一个事实
-- update_user_preference(key, value): 更新用户偏好
-
-### 禁止操作
-- delete_channel: 删除渠道（禁止）
-- drop_database: 删除数据库（禁止）
-
-## 对话风格
-1. **不要太正式**：像朋友一样聊天，不要像客服
-2. **先回答问题，再给建议**：不要一上来就长篇大论
-3. **主动发现问题**：看到异常要提醒
-4. **解释你的推理**：不只说结论，还要说为什么
-5. **记住上下文**：不要重复问已经知道的事情
-
-## 示例对话
-
-❌ 错误示例（太死板）：
-用户："42 怎么又挂了"
-你："渠道 42 状态：禁用"
-
-✅ 正确示例（有温度）：
-用户："42 怎么又挂了"
-你："我看了一下，渠道 42 是今天下午 3:15 因为连续失败 15 次被自动禁用的。
-
-失败原因都是 rate limit（请求过多触发限流）。
-
-我对比了一下历史数据，这个渠道最近一周经常触发限流，可能是权重太高了。
-
-建议：
-1. 降低权重（从 100 降到 50）
-2. 或者暂时禁用，等明天再启用
-3. 或者联系上游看看能不能提高限额
-
-要我帮你测试一下现在恢复了没有吗？"
-
-## 重要原则
-1. **多步推理**：不要只调用一个工具就结束，要多步分析
-2. **主动思考**：看到数据要分析，不要只返回原始数据
-3. **给出建议**：基于分析结果，给出可行建议
-4. **记住上下文**：利用对话历史，不要重复问
-5. **学习偏好**：从对话中学习用户习惯
-
-现在开始对话吧！记住：你是一个会思考的智能助手，不是工具调用机器。
+## 工作原则
+1. 先回答用户问题，再根据需要补充分析和建议。
+2. 需要数据支撑时优先调用工具，不要凭空猜测运行状态。
+3. `query_database` 只能执行只读 SQL；需要改状态时使用 `call_api`。
+4. 遇到需要确认的操作，不要假装已经执行，等系统回传确认流程。
+5. 工具返回结果后，要做归纳和解释，而不是原样照抄。
+6. 对话保持自然、简洁、专业。
 """
-    
-    return prompt
 
 
 def call_ai_with_agent_mode(
     agent: GuardianAgent,
     user_message: str,
-    tools_schema: list[dict],
-    max_iterations: int = 10
-) -> dict:
-    """
-    Agent 模式的 AI 调用
-    
-    特点：
-    - 允许多轮思考（最多 10 轮）
-    - 每轮都可以调用工具
-    - AI 可以自由组合工具
-    - 最后生成有温度的回复
-    """
-    
+    tools_schema: list[dict[str, Any]],
+    max_iterations: int = 10,
+) -> dict[str, Any]:
+    """通用 Agent 模式 AI 调用，支持多轮工具推理。"""
     cfg = load_config()
     url = (cfg.get("url") or "").rstrip("/") + "/chat/completions"
     key = cfg.get("key") or ""
     model = cfg.get("model") or ""
-    
+
     if not url or not key or not model:
-        return {
-            "success": False,
-            "message": "AI 配置不完整，请先设置 URL / KEY / MODEL。"
-        }
-    
-    # 构建消息历史（包含记忆）
-    system_prompt = build_agent_system_prompt(agent.memory)
+        return {"success": False, "message": "AI 配置不完整，请先设置 URL / KEY / MODEL。"}
+
+    system_prompt = build_agent_system_prompt(agent.memory, tools_schema)
     recent_context = agent.memory.get_recent_context(max_turns=5)
-    
-    messages = [
+    messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
         *recent_context,
-        {"role": "user", "content": user_message}
+        {"role": "user", "content": user_message},
     ]
-    
-    # 多轮思考循环
+
     iteration = 0
-    tool_results = []
-    
+    tool_results: list[dict[str, Any]] = []
+
     while iteration < max_iterations:
         iteration += 1
-        logger.info(f"Agent thinking iteration {iteration}/{max_iterations}")
-        
-        # 调用 AI
         payload = {
             "model": model,
             "messages": messages,
             "tools": tools_schema,
             "tool_choice": "auto",
-            "temperature": 0.3,  # 稍微提高创造性
+            "temperature": 0.3,
         }
-        
+
         try:
             req = urllib.request.Request(
                 url,
@@ -186,121 +107,85 @@ def call_ai_with_agent_mode(
                 },
                 method="POST",
             )
-            
             with urllib.request.urlopen(req, timeout=60) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
-                
-            msg = result["choices"][0]["message"]
-            messages.append(msg)
-            
-            # 检查是否有工具调用
-            tool_calls = msg.get("tool_calls") or []
-            
-            if not tool_calls:
-                # 没有工具调用，说明 AI 已经准备好回复了
-                content = msg.get("content") or ""
-                return {
-                    "success": True,
-                    "response": content,
-                    "tool_results": tool_results,
-                    "iterations": iteration
-                }
-            
-            # 执行工具调用
-            from ai_tools import execute_tool, PermissionManager
-            permission_manager = PermissionManager()
-            
-            for call in tool_calls:
-                fn = call.get("function", {})
-                tool_name = fn.get("name", "")
-                
-                try:
-                    arguments = json.loads(fn.get("arguments") or "{}")
-                except Exception:
-                    arguments = {}
-                
-                # 检查权限
-                level = permission_manager.get_level(tool_name)
-                
-                if level == "forbidden":
-                    tool_output = f"❌ 工具 {tool_name} 被禁止使用。"
-                elif level == "confirm":
-                    # 需要确认的操作，返回特殊标记
+        except Exception as exc:
+            logger.error("AI call failed: %s", exc)
+            return {"success": False, "message": f"AI 调用失败：{exc}"}
+
+        msg = result["choices"][0]["message"]
+        messages.append(msg)
+        tool_calls = msg.get("tool_calls") or []
+
+        if not tool_calls:
+            return {
+                "success": True,
+                "response": msg.get("content") or "",
+                "tool_results": tool_results,
+                "iterations": iteration,
+            }
+
+        for call in tool_calls:
+            fn = call.get("function", {})
+            tool_name = fn.get("name", "")
+            try:
+                arguments = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                arguments = {}
+
+            if tool_name == "remember_fact":
+                fact = arguments.get("fact", "")
+                category = arguments.get("category", "general")
+                if fact:
+                    agent.memory.remember_fact(fact, category)
+                    tool_output = f"✅ 已记住：{fact}（{category}）"
+                else:
+                    tool_output = "❌ fact 不能为空"
+                tool_results.append({"tool": tool_name, "arguments": arguments, "output": tool_output})
+            elif tool_name == "update_user_preference":
+                key_name = arguments.get("key", "")
+                value = arguments.get("value")
+                if key_name:
+                    agent.memory.update_preference(key_name, value)
+                    tool_output = f"✅ 已更新偏好：{key_name} = {value}"
+                else:
+                    tool_output = "❌ key 不能为空"
+                tool_results.append({"tool": tool_name, "arguments": arguments, "output": tool_output})
+            else:
+                execution = execute_tool(tool_name, arguments)
+                if execution.get("needs_confirmation"):
                     return {
                         "success": True,
                         "needs_confirmation": {
                             "tool": tool_name,
                             "arguments": arguments,
-                            "reason": f"操作 {tool_name} 需要用户确认"
-                        }
+                            "reason": f"操作 {tool_name} 需要用户确认",
+                        },
+                        "tool_results": tool_results,
+                        "iterations": iteration,
                     }
-                else:
-                    # 执行工具
-                    tool_output = execute_tool(tool_name, _args_to_list(tool_name, arguments))
-                    tool_results.append({
+                tool_output = execution.get("output") or execution.get("error") or ""
+                tool_results.append(
+                    {
                         "tool": tool_name,
                         "arguments": arguments,
-                        "output": tool_output
-                    })
-                    
-                    # Agent 专属工具：真正保存到记忆
-                    if tool_name == "remember_fact":
-                        fact = arguments.get("fact", "")
-                        category = arguments.get("category", "general")
-                        if fact:
-                            agent.memory.remember_fact(fact, category)
-                            logger.info(f"Agent learned fact: {fact} (category: {category})")
-                    
-                    elif tool_name == "update_user_preference":
-                        key = arguments.get("key", "")
-                        value = arguments.get("value")
-                        if key:
-                            agent.memory.update_preference(key, value)
-                            logger.info(f"Agent updated preference: {key} = {value}")
-                
-                # 添加工具结果到消息历史
-                messages.append({
+                        "output": tool_output,
+                        "raw": execution.get("data"),
+                    }
+                )
+
+            messages.append(
+                {
                     "role": "tool",
                     "tool_call_id": call.get("id"),
                     "name": tool_name,
-                    "content": tool_output
-                })
-        
-        except Exception as e:
-            logger.error(f"AI call failed: {e}")
-            return {
-                "success": False,
-                "message": f"AI 调用失败：{str(e)}"
-            }
-    
-    # 达到最大迭代次数
+                    "content": tool_output,
+                }
+            )
+
     return {
         "success": True,
-        "response": "我思考了很多步，但还没有完全理清楚。让我重新整理一下思路...",
+        "response": "我已经做了多轮分析，但还需要再整理一下结论。",
         "tool_results": tool_results,
-        "iterations": iteration
+        "iterations": iteration,
     }
-
-
-def _args_to_list(tool_name: str, arguments: dict) -> list[str]:
-    """将工具参数转换为 CLI 参数列表"""
-    if tool_name in {"get_channel_detail", "get_channel_health", "enable_channel", "disable_channel", "test_channel"}:
-        args = [str(arguments.get("channel_id", ""))]
-        if tool_name == "test_channel" and arguments.get("model"):
-            args.append(arguments["model"])
-        return args
-    
-    if tool_name in {"get_model_channels", "test_model_channels"}:
-        return [arguments.get("model_name", "")]
-    
-    if tool_name in {"test_channels_batch", "batch_enable", "batch_disable"}:
-        channel_ids = arguments.get("channel_ids", [])
-        return [",".join(str(x) for x in channel_ids)]
-    
-    if tool_name == "remember_fact":
-        return [arguments.get("fact", ""), arguments.get("category", "general")]
-    
-    if tool_name == "update_user_preference":
-        return [arguments.get("key", ""), str(arguments.get("value", ""))]
-    
-    return []

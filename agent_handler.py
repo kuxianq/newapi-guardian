@@ -15,7 +15,7 @@ from telegram.ext import ContextTypes
 from agent_core import GuardianAgent
 from agent_brain import call_ai_with_agent_mode
 from ai_config import get_enabled, get_mode_enabled
-from ai_tools import get_openai_tools_schema
+from tools_new.registry import get_registry
 
 logger = logging.getLogger("guardian.agent.handler")
 
@@ -85,10 +85,9 @@ async def handle_agent_message(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # 调用 Agent 处理
     try:
-        # 获取工具 schema
-        tools_schema = get_openai_tools_schema()
-        
-        # 添加 Agent 专属工具
+        registry = get_registry()
+        tools_schema = registry.get_openai_schema()
+
         tools_schema.extend([
             {
                 "type": "function",
@@ -123,8 +122,7 @@ async def handle_agent_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 }
             }
         ])
-        
-        # Agent 模式调用 AI
+
         result = call_ai_with_agent_mode(
             agent=agent,
             user_message=user_prompt,
@@ -200,8 +198,7 @@ async def agent_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     if data.startswith("agent_confirm:"):
         import json
-        from ai_tools import execute_tool
-        from agent_brain import _args_to_list
+        from tools_new.executor import execute_tool
         
         _, tool, arg_json = data.split(":", 2)
         
@@ -210,20 +207,20 @@ async def agent_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             arguments = {}
         
-        # 执行工具
-        cli_args = _args_to_list(tool, arguments)
-        result = execute_tool(tool, cli_args)
+        result = execute_tool(tool, arguments, require_confirmation=True)
         
         # 获取 Agent 实例
         user_id = update.effective_user.id
         agent = get_agent(user_id)
-        
-        # 继续 AI 对话（把执行结果告诉 AI）
-        continuation_prompt = f"用户已确认执行 {tool}，结果如下：\n{result}\n\n请总结一下并告诉用户。"
+        agent.memory.add_turn(
+            f"[confirmed] {tool}",
+            result.get("output", ""),
+            {"tool_results": [result], "confirmed": True},
+        )
         
         # 简化版：直接返回结果
         await query.edit_message_text(
-            f"✅ 已执行\n\n{result}",
+            f"✅ 已执行\n\n{result.get('output', '')}",
             parse_mode="Markdown"
         )
         
