@@ -1,6 +1,8 @@
 """NewAPI Guardian Bot - Telegram Bot 主入口 v2"""
 import logging
 import asyncio
+from pathlib import PurePath
+from uuid import uuid4
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes,
@@ -21,7 +23,7 @@ from formatter import (
     fmt_recent_logs,
 )
 from backup import create_backup, list_backups, restore_backup
-from newapi_client import test_channel as api_test_channel, test_channels_batch, set_channel_status as api_set_channel_status
+from newapi_client import test_channel as api_test_channel, async_test_channels_batch, set_channel_status as api_set_channel_status
 from ai_config import load_config, set_url as ai_set_url, set_key as ai_set_key, set_model as ai_set_model, set_enabled as ai_set_enabled, get_mode_enabled, set_mode_enabled
 # from ai_brain import handle_ai_message, ai_callback_handler  # 旧版
 from agent_handler import handle_agent_message, agent_callback_handler  # Agent 模式
@@ -36,6 +38,25 @@ logger = logging.getLogger("guardian")
 
 # 会话状态
 CONFIRM_RESTORE = 1
+PENDING_RESTORE_KEY = "pending_restores"
+
+
+def _create_pending_restore(context: ContextTypes.DEFAULT_TYPE, filename: str) -> str:
+    """Store a validated restore target behind a short callback id."""
+    restore_id = uuid4().hex[:12]
+    pending = context.user_data.setdefault(PENDING_RESTORE_KEY, {})
+    pending[restore_id] = filename
+    return restore_id
+
+
+def _pop_valid_pending_restore(context: ContextTypes.DEFAULT_TYPE, restore_id: str) -> str | None:
+    """Return a pending restore filename only if it is still in the known backup list."""
+    pending = context.user_data.get(PENDING_RESTORE_KEY, {})
+    filename = pending.pop(restore_id, None)
+    if not filename or PurePath(filename).name != filename:
+        return None
+    known_names = {backup["filename"] for backup in list_backups()}
+    return filename if filename in known_names else None
 
 
 def _parse_channel_ids(args: list[str]) -> list[int]:
@@ -106,14 +127,31 @@ def authorized(func):
 
 # ── 菜单 ──
 def main_menu_kb():
-    """主菜单布局（Phase 4 调整版）。"""
+    """主菜单：只保留高频入口，具体动作下沉到二级菜单。"""
     mode_status = "开启" if get_mode_enabled() else "关闭"
 
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"🤖 AI模式: {mode_status}", callback_data="ai_mode_toggle"),
-            InlineKeyboardButton("📊 总览", callback_data="overview"),
+            InlineKeyboardButton("📊 状态概览", callback_data="overview"),
+            InlineKeyboardButton("📈 统计报表", callback_data="menu_stats"),
         ],
+        [
+            InlineKeyboardButton("🔧 渠道管理", callback_data="menu_channels"),
+            InlineKeyboardButton("💾 数据安全", callback_data="menu_data"),
+        ],
+        [
+            InlineKeyboardButton(f"🤖 AI 设置 · {mode_status}", callback_data="menu_ai"),
+        ],
+        [
+            InlineKeyboardButton("ℹ️ 系统信息", callback_data="system_info"),
+            InlineKeyboardButton("🛟 帮助", callback_data="help_prompt"),
+        ],
+    ])
+
+
+def stats_menu_kb():
+    """统计报表二级菜单。"""
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🖥️ Console", callback_data="console"),
             InlineKeyboardButton("📅 今日统计", callback_data="today"),
@@ -123,47 +161,80 @@ def main_menu_kb():
             InlineKeyboardButton("👤 用户排行", callback_data="users"),
         ],
         [
-            InlineKeyboardButton("🔧 渠道管理", callback_data="channel_manage"),
-            InlineKeyboardButton("🧪 测试全部", callback_data="test_all"),
+            InlineKeyboardButton("🔑 Token 排行", callback_data="tokens"),
+            InlineKeyboardButton("📋 使用日志", callback_data="recent_logs"),
         ],
         [
-            InlineKeyboardButton("📋 使用日志", callback_data="recent_logs"),
+            InlineKeyboardButton("🐢 慢渠道", callback_data="slow"),
+            InlineKeyboardButton("📋 24h 汇总", callback_data="report"),
+        ],
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu")],
+    ])
+
+
+def channels_menu_kb():
+    """渠道管理二级菜单。"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🧪 测试全部", callback_data="test_all"),
             InlineKeyboardButton("🔌 按渠道查", callback_data="channel_prompt"),
         ],
         [
-            InlineKeyboardButton("💾 备份数据库", callback_data="backup"),
+            InlineKeyboardButton("🧩 按模型查", callback_data="model_prompt"),
+            InlineKeyboardButton("⚠️ 禁用失败渠道", callback_data="disable_failed_prompt"),
+        ],
+        [
+            InlineKeyboardButton("🟢 启用渠道", callback_data="enable_prompt"),
+            InlineKeyboardButton("🔴 禁用渠道", callback_data="disable_prompt"),
+        ],
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu")],
+    ])
+
+
+def data_menu_kb():
+    """数据安全二级菜单。"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💾 立即备份", callback_data="backup"),
             InlineKeyboardButton("📂 备份列表", callback_data="backup_list"),
         ],
         [
-            InlineKeyboardButton("🤖 AI配置", callback_data="ai_config_menu"),
-            InlineKeyboardButton("ℹ️ 系统信息", callback_data="system_info"),
+            InlineKeyboardButton("♻️ 恢复说明", callback_data="restore_prompt"),
+        ],
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu")],
+    ])
+
+
+def ai_menu_kb():
+    """AI 设置二级菜单。"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🤖 AI 配置", callback_data="ai_config_menu"),
+            InlineKeyboardButton("🔁 切换 AI 模式", callback_data="ai_mode_toggle"),
         ],
         [
-            InlineKeyboardButton("🛟 帮助", callback_data="help_prompt"),
+            InlineKeyboardButton("📝 修改 URL", callback_data="ai_set_url"),
+            InlineKeyboardButton("🔑 修改 Key", callback_data="ai_set_key"),
         ],
+        [
+            InlineKeyboardButton("🤖 修改模型", callback_data="ai_set_model"),
+        ],
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu")],
     ])
 
 
 def status_kb():
-    """状态页快捷按钮，比 back_btn 更像入口。"""
+    """状态页快捷按钮：保留高频入口并能回到二级菜单。"""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🖥️ Console", callback_data="console"),
             InlineKeyboardButton("📅 今日", callback_data="today"),
         ],
         [
-            InlineKeyboardButton("📈 模型", callback_data="models"),
-            InlineKeyboardButton("👤 用户", callback_data="users"),
-            InlineKeyboardButton("🔑 Token", callback_data="tokens"),
+            InlineKeyboardButton("📈 统计报表", callback_data="menu_stats"),
+            InlineKeyboardButton("🔧 渠道管理", callback_data="menu_channels"),
         ],
-        [
-            InlineKeyboardButton("🐢 慢渠道", callback_data="slow"),
-        ],
-        [
-            InlineKeyboardButton("🧪 测试全部", callback_data="test_all"),
-            InlineKeyboardButton("💾 备份", callback_data="backup"),
-        ],
-        [InlineKeyboardButton("📱 完整菜单", callback_data="menu")],
+        [InlineKeyboardButton("📱 主菜单", callback_data="menu")],
     ])
 
 
@@ -203,13 +274,21 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def build_overview_text(minutes: int = 60) -> str:
+    """Build the richer status overview shared by /status and inline buttons."""
+    stats = newapi_db.get_overview_stats(minutes=minutes)
+    fail_ch = newapi_db.get_channel_failure_stats(minutes=minutes)
+    fail_m = newapi_db.get_model_failure_stats(minutes=minutes)
+    today = newapi_db.get_today_stats()
+    slow = newapi_db.get_slow_channels(minutes=minutes)
+    balance = newapi_db.get_balance_suspect_channels(minutes=120)
+    return fmt_overview(stats, fail_ch, fail_m, today, slow, balance)
+
+
 @authorized
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stats = newapi_db.get_overview_stats(minutes=60)
-    fail_ch = newapi_db.get_channel_failure_stats(minutes=60)
-    fail_m = newapi_db.get_model_failure_stats(minutes=60)
-    text = fmt_overview(stats, fail_ch, fail_m)
-    text += "\n\n🌷 *快捷入口*\n点下面按钮可以继续查看 Console、今日统计、模型/用户/Token 排行、测试和备份。"
+    text = build_overview_text(minutes=60)
+    text += "\n\n🌷 *快捷入口*\n点下面按钮继续查看统计、渠道和主菜单。"
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=status_kb())
 
 
@@ -277,7 +356,10 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = newapi_db.get_overview_stats(minutes=1440)
     fail_ch = newapi_db.get_channel_failure_stats(minutes=1440)
     fail_m = newapi_db.get_model_failure_stats(minutes=1440)
-    text = fmt_overview(stats, fail_ch, fail_m).replace("最近 1 小时", "最近 24 小时")
+    today = newapi_db.get_today_stats()
+    slow = newapi_db.get_slow_channels(minutes=1440)
+    balance = newapi_db.get_balance_suspect_channels(minutes=1440)
+    text = fmt_overview(stats, fail_ch, fail_m, today, slow, balance).replace("最近 1h", "最近 24h")
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_btn())
 
 
@@ -337,7 +419,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     # 调用批量测试 API
-    batch_result = test_channels_batch(channel_ids)
+    batch_result = await async_test_channels_batch(channel_ids)
     
     # 格式化结果
     lines = [
@@ -496,7 +578,10 @@ async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
         return
     filename = context.args[0]
-    context.user_data["restore_file"] = filename
+    if PurePath(filename).name != filename or filename not in {b["filename"] for b in list_backups()}:
+        await update.message.reply_text("❌ 备份文件不存在或文件名无效。", reply_markup=back_btn())
+        return
+    restore_id = _create_pending_restore(context, filename)
     await update.message.reply_text(
         f"⚠️ *确认恢复数据库？*\n\n"
         f"将恢复: `{safe_text(filename)}`\n"
@@ -505,7 +590,7 @@ async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("✅ 确认恢复", callback_data=f"confirm_restore_{filename}"),
+                InlineKeyboardButton("✅ 确认恢复", callback_data=f"confirm_restore:{restore_id}"),
                 InlineKeyboardButton("❌ 取消", callback_data="menu"),
             ]
         ]),
@@ -826,7 +911,52 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_mode_enabled(enabled)
         status = "开启" if enabled else "关闭"
         text = f"🤖 AI 对话模式已切换为: *{status}*\n\n{'现在所有非命令文本都会交给 AI 处理。' if enabled else '现在只有 `@ai` 前缀消息会交给 AI 处理。'}"
-        markup = main_menu_kb()
+        markup = ai_menu_kb()
+
+    elif data == "menu_stats":
+        text = (
+            "📈 *统计报表*\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "这里放使用量、排行、慢请求和日志入口。"
+        )
+        markup = stats_menu_kb()
+
+    elif data == "menu_channels":
+        text = (
+            "🔧 *渠道管理*\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "这里放渠道查询、测试、启用/禁用和异常处理入口。\n\n"
+            "💡 添加、编辑、删除渠道仍建议在 NewAPI 网页端操作。"
+        )
+        markup = channels_menu_kb()
+
+    elif data == "menu_data":
+        text = (
+            "💾 *数据安全*\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "这里放备份、备份列表和恢复说明。\n\n"
+            "⚠️ 恢复数据库属于高风险操作，仍需要二次确认。"
+        )
+        markup = data_menu_kb()
+
+    elif data == "menu_ai":
+        cfg = load_config()
+        raw_key = cfg.get("key", "") or ""
+        if len(raw_key) > 10:
+            masked_key = f"{raw_key[:6]}...{raw_key[-4:]}"
+        elif raw_key:
+            masked_key = raw_key[:3] + "***"
+        else:
+            masked_key = "未设置"
+        text = (
+            "🤖 *AI 设置*\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"AI 功能: {'已启用 ✅' if cfg.get('enabled') else '未启用 ❌'}\n"
+            f"对话模式: {'开启 ✅' if get_mode_enabled() else '关闭 ❌'}\n"
+            f"模型: `{safe_text(cfg.get('model') or '未设置')}`\n"
+            f"Key: `{safe_text(masked_key)}`"
+        )
+        markup = ai_menu_kb()
 
     elif data == "ai_config_menu":
         cfg = load_config()
@@ -856,7 +986,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("✅ 启用", callback_data="ai_enable"),
                 InlineKeyboardButton("❌ 禁用", callback_data="ai_disable"),
             ],
-            [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu")],
+            [InlineKeyboardButton("🔙 返回 AI 设置", callback_data="menu_ai")],
         ])
 
     elif data == "ai_set_url":
@@ -879,10 +1009,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         markup = back_btn()
 
     elif data == "overview":
-        stats = newapi_db.get_overview_stats(minutes=60)
-        fail_ch = newapi_db.get_channel_failure_stats(minutes=60)
-        fail_m = newapi_db.get_model_failure_stats(minutes=60)
-        text = fmt_overview(stats, fail_ch, fail_m)
+        text = build_overview_text(minutes=60)
 
     elif data == "slow":
         slow = newapi_db.get_slow_channels(minutes=60)
@@ -892,21 +1019,42 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats = newapi_db.get_overview_stats(minutes=1440)
         fail_ch = newapi_db.get_channel_failure_stats(minutes=1440)
         fail_m = newapi_db.get_model_failure_stats(minutes=1440)
-        text = fmt_overview(stats, fail_ch, fail_m).replace("最近 1 小时", "最近 24 小时")
+        today = newapi_db.get_today_stats()
+        slow = newapi_db.get_slow_channels(minutes=1440)
+        balance = newapi_db.get_balance_suspect_channels(minutes=1440)
+        text = fmt_overview(stats, fail_ch, fail_m, today, slow, balance).replace("最近 1h", "最近 24h")
 
     elif data == "recent_logs":
         logs = newapi_db.get_recent_logs(limit=10)
         text = fmt_recent_logs(logs)
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 刷新", callback_data="recent_logs")],
-            [InlineKeyboardButton("🔙 返回", callback_data="menu")],
+            [InlineKeyboardButton("🔙 返回统计报表", callback_data="menu_stats")],
         ])
 
     elif data == "model_prompt":
-        text = "请发送模型名称查询:\n`/model gpt-5.4`"
+        text = "🧩 *按模型查询*\n\n请发送模型名称：\n`/model gpt-5.4`"
+        markup = channels_menu_kb()
 
     elif data == "channel_prompt":
-        text = "请发送渠道 ID 查询:\n`/channel 105`"
+        text = "🔌 *按渠道查询*\n\n请发送渠道 ID：\n`/channel 105`"
+        markup = channels_menu_kb()
+
+    elif data == "enable_prompt":
+        text = "🟢 *启用渠道*\n\n请发送：\n`/enable 渠道ID`\n\n多个渠道可以空格分隔：\n`/enable 101 102 103`"
+        markup = channels_menu_kb()
+
+    elif data == "disable_prompt":
+        text = "🔴 *禁用渠道*\n\n请发送：\n`/disable 渠道ID`\n\n多个渠道可以空格分隔：\n`/disable 101 102 103`"
+        markup = channels_menu_kb()
+
+    elif data == "disable_failed_prompt":
+        text = "⚠️ *一键禁用失败渠道*\n\n请发送：\n`/disable_failed`\n\n也可以指定失败阈值：\n`/disable_failed 5`"
+        markup = channels_menu_kb()
+
+    elif data == "restore_prompt":
+        text = "♻️ *恢复数据库*\n\n先查看备份：\n`/backup_list`\n\n再发送：\n`/restore 文件名`\n\n⚠️ 恢复会覆盖当前数据库，执行前会再次确认。"
+        markup = data_menu_kb()
 
     elif data == "backup":
         await q.edit_message_text("💾 正在备份数据库...")
@@ -1020,6 +1168,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ *安全提示*\n"
             "为了数据安全，添加/编辑/删除渠道请在 NewAPI 网页端操作。"
         )
+        markup = channels_menu_kb()
 
     elif data == "system_info":
         import time
@@ -1027,7 +1176,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from datetime import datetime, timedelta
         
         # Bot 版本
-        bot_version = "v2.1.0"
+        bot_version = "v2.2.0"
         
         # 运行时长（从进程启动时间计算）
         try:
@@ -1161,8 +1310,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data.startswith("confirm_disable_failed_"):
-        _, _, rest = data.split("_", 2)
+        rest = data.removeprefix("confirm_disable_failed_")
         threshold_str, ids_str = rest.split("_", 1)
+        int(threshold_str)  # validate callback shape; ids carry the actual operation target
         ids = [int(x) for x in ids_str.split(",") if x]
         await _execute_batch_status(q, ids, 2, edit=True)
         return
@@ -1172,15 +1322,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _execute_batch_status(q, ids, 2, edit=True)
         return
 
-    elif data.startswith("confirm_restore_"):
-        filename = data.replace("confirm_restore_", "")
-        await q.edit_message_text(f"♻️ 正在恢复 `{safe_text(filename)}`...\n恢复前会自动备份当前状态。",
-                                   parse_mode=ParseMode.MARKDOWN)
-        ok, info = restore_backup(filename)
-        if ok:
-            text = f"✅ {info}"
+    elif data.startswith("confirm_restore:"):
+        restore_id = data.removeprefix("confirm_restore:")
+        filename = _pop_valid_pending_restore(context, restore_id)
+        if not filename:
+            text = "❌ 恢复确认已过期或备份文件无效，请重新执行 /restore。"
         else:
-            text = f"❌ {info}"
+            await q.edit_message_text(f"♻️ 正在恢复 `{safe_text(filename)}`...\n恢复前会自动备份当前状态。",
+                                      parse_mode=ParseMode.MARKDOWN)
+            ok, info = restore_backup(filename)
+            if ok:
+                text = f"✅ {info}"
+            else:
+                text = f"❌ {info}"
 
     else:
         text = "未知操作。"
@@ -1200,7 +1354,14 @@ async def daily_report(app: Application):
     stats = newapi_db.get_overview_stats(minutes=1440)
     fail_ch = newapi_db.get_channel_failure_stats(minutes=1440)
     fail_m = newapi_db.get_model_failure_stats(minutes=1440)
-    text = "📋 *每日汇总*\n\n" + fmt_overview(stats, fail_ch, fail_m).replace("最近 1 小时", "最近 24 小时")
+    text = "📋 *每日汇总*\n\n" + fmt_overview(
+        stats,
+        fail_ch,
+        fail_m,
+        newapi_db.get_today_stats(),
+        newapi_db.get_slow_channels(minutes=1440),
+        newapi_db.get_balance_suspect_channels(minutes=1440),
+    ).replace("最近 1h", "最近 24h")
     for uid in AUTHORIZED_IDS:
         try:
             await app.bot.send_message(uid, text, parse_mode=ParseMode.MARKDOWN)

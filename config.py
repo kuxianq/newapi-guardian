@@ -26,7 +26,7 @@ MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "newapi")
 
 # NewAPI
-NEWAPI_BASE_URL = os.getenv("NEWAPI_BASE_URL", "http://127.0.0.1:3000")
+NEWAPI_BASE_URL = os.getenv("NEWAPI_BASE_URL", "http://localhost:3000")
 NEWAPI_ADMIN_TOKEN = read_file_env("NEWAPI_ADMIN_TOKEN")
 NEWAPI_ADMIN_USER_ID = os.getenv("NEWAPI_ADMIN_USER_ID", "1")
 

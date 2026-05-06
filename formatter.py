@@ -23,42 +23,108 @@ def truncate(s: str, max_len: int = 60) -> str:
     return s[:max_len] + "…" if len(s) > max_len else s
 
 
-def fmt_overview(stats: dict, fail_channels: list, fail_models: list) -> str:
-    enabled = stats.get("enabled_channels", 0)
-    disabled = stats.get("disabled_channels", 0)
-    reqs = stats.get("recent_requests", 0)
-    success = stats.get("recent_success", 0)
-    fail = reqs - success if reqs and success else 0
-    rate = f"{fail/reqs*100:.1f}%" if reqs else "N/A"
+def _pct(part: int | float, total: int | float) -> str:
+    if not total:
+        return "N/A"
+    return f"{float(part) / float(total) * 100:.1f}%"
+
+
+def _health_label(score: int) -> str:
+    if score >= 90:
+        return "🟢 很稳"
+    if score >= 75:
+        return "🟡 可用"
+    if score >= 60:
+        return "🟠 需观察"
+    return "🔴 需处理"
+
+
+def _aggregate_model_failures(fail_models: list) -> list[tuple[str, int]]:
+    model_agg: dict[str, int] = {}
+    for row in fail_models:
+        model = row.get("model_name") or "unknown"
+        model_agg[model] = model_agg.get(model, 0) + int(row.get("fail_count") or 0)
+    return sorted(model_agg.items(), key=lambda item: -item[1])
+
+
+def _build_overview_suggestions(fail_channels: list, slow_channels: list, balance_suspects: list) -> list[str]:
+    suggestions = []
+    if balance_suspects:
+        ch = balance_suspects[0]
+        name = truncate(ch.get("channel_name") or f"ID:{ch.get('channel_id')}", 24)
+        suggestions.append(f"优先检查 `{name}` 的余额 / quota。")
+    if fail_channels:
+        ch = fail_channels[0]
+        name = truncate(ch.get("channel_name") or f"ID:{ch.get('channel_id')}", 24)
+        suggestions.append(f"`{name}` 最近失败 {ch.get('fail_count')} 次，建议测试或临时切走。")
+    if slow_channels:
+        ch = slow_channels[0]
+        name = truncate(ch.get("channel_name") or f"ID:{ch.get('channel_id')}", 24)
+        suggestions.append(f"`{name}` 平均 {float(ch.get('avg_time') or 0):.1f}s，建议观察慢请求。")
+    if not suggestions:
+        suggestions.append("当前没有明显异常，保持观察即可。")
+    return suggestions[:3]
+
+
+def fmt_overview(
+    stats: dict,
+    fail_channels: list,
+    fail_models: list,
+    today_stats: dict | None = None,
+    slow_channels: list | None = None,
+    balance_suspects: list | None = None,
+) -> str:
+    enabled = int(stats.get("enabled_channels") or 0)
+    disabled = int(stats.get("disabled_channels") or 0)
+    reqs = int(stats.get("recent_requests") or 0)
+    success = int(stats.get("recent_success") or 0)
+    fail = max(0, reqs - success)
+    success_rate = _pct(success, reqs)
+
+    slow_channels = slow_channels or []
+    balance_suspects = balance_suspects or []
+    today_stats = today_stats or {}
+    today_calls = int(today_stats.get("total_calls") or 0)
+    today_quota = fmt_quota(today_stats.get("total_quota") or 0)
+    today_tokens = int(today_stats.get("total_prompt") or 0) + int(today_stats.get("total_completion") or 0)
+
+    health_score = 100
+    if reqs:
+        health_score -= min(45, int(fail / reqs * 100))
+    health_score -= min(25, len(fail_channels) * 6)
+    health_score -= min(15, len(slow_channels) * 3)
+    health_score -= min(15, len(balance_suspects) * 8)
+    health_score = max(0, min(100, health_score))
 
     lines = [
-        "📊 *NewAPI 总览*（最近 1 小时）",
+        "📊 *NewAPI 状态概览*",
+        "━━━━━━━━━━━━━━━━━━",
         "",
-        f"✅ 启用渠道：{enabled}",
-        f"⛔ 禁用渠道：{disabled}",
-        f"📨 请求总数：{reqs}",
-        f"❌ 失败数：{fail}（{rate}）",
+        f"{_health_label(health_score)} · 健康度：`{health_score}/100`",
+        f"📨 最近 1h：`{reqs}` 次 | 成功率 `{success_rate}` | 失败 `{fail}`",
+        f"📅 今日：`{today_calls}` 次 | 消耗 `{today_quota}` | Tokens `{today_tokens:,}`",
+        "",
+        "🔌 *渠道摘要*",
+        f"启用 `{enabled}` / 禁用 `{disabled}`",
+        f"异常 `{len(fail_channels)}` | 慢渠道 `{len(slow_channels)}` | 疑似余额 `{len(balance_suspects)}`",
     ]
 
-    if fail_channels:
-        lines.append("")
-        lines.append("🔥 *失败最多的渠道 Top 5*")
-        for i, ch in enumerate(fail_channels[:5], 1):
-            name = truncate(ch.get("channel_name") or f"ID:{ch['channel_id']}", 30)
-            lines.append(f"  {i}. `{name}` — {ch['fail_count']}次")
+    model_top = _aggregate_model_failures(fail_models)[:3]
+    if model_top:
+        lines.extend(["", "🧩 *模型异常 Top*"])
+        for i, (model, count) in enumerate(model_top, 1):
+            lines.append(f"{i}. `{truncate(model, 28)}` — {count} 次")
 
-    if fail_models:
-        # 按模型聚合
-        model_agg: dict[str, int] = {}
-        for row in fail_models:
-            m = row["model_name"]
-            model_agg[m] = model_agg.get(m, 0) + row["fail_count"]
-        top_models = sorted(model_agg.items(), key=lambda x: -x[1])[:5]
-        if top_models:
-            lines.append("")
-            lines.append("🧩 *失败最多的模型 Top 5*")
-            for i, (m, cnt) in enumerate(top_models, 1):
-                lines.append(f"  {i}. `{truncate(m, 35)}` — {cnt}次")
+    if fail_channels:
+        lines.extend(["", "🔥 *失败渠道 Top*"])
+        for i, ch in enumerate(fail_channels[:3], 1):
+            name = truncate(ch.get("channel_name") or f"ID:{ch['channel_id']}", 24)
+            lines.append(f"{i}. `{name}` — {ch.get('fail_count')} 次")
+
+    suggestions = _build_overview_suggestions(fail_channels, slow_channels, balance_suspects)
+    lines.extend(["", "🧭 *当前建议*"])
+    for item in suggestions:
+        lines.append(f"- {item}")
 
     return "\n".join(lines)
 

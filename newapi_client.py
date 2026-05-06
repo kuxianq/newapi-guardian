@@ -5,6 +5,7 @@ import urllib.error
 import json
 import time
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from config import NEWAPI_BASE_URL, NEWAPI_ADMIN_TOKEN, NEWAPI_ADMIN_USER_ID
 
 logger = logging.getLogger("guardian.api")
@@ -51,52 +52,51 @@ def test_channel(channel_id: int, model: str = "") -> dict:
     }
 
 
-def test_channels_batch(channel_ids: list[int], model: str = "") -> dict:
-    """批量并发测试多个渠道（同步包装）"""
-    async def _run():
-        loop = asyncio.get_running_loop()
-        tasks = []
-        for channel_id in channel_ids:
-            logger.info(f"Testing channel {channel_id}...")
-            tasks.append(loop.run_in_executor(None, test_channel, channel_id, model))
-        raw_results = await asyncio.gather(*tasks)
-        results = []
-        success_count = 0
-        failed_count = 0
-        for channel_id, result in zip(channel_ids, raw_results):
-            result["id"] = channel_id
-            results.append(result)
-            if result["success"]:
-                success_count += 1
-            else:
-                failed_count += 1
-        return {
-            "total": len(channel_ids),
-            "success_count": success_count,
-            "failed_count": failed_count,
-            "results": results,
-        }
+async def async_test_channels_batch(channel_ids: list[int], model: str = "", max_workers: int = 10) -> dict:
+    """批量并发测试多个渠道（异步入口，供 Bot 事件循环内调用）。"""
+    loop = asyncio.get_running_loop()
+
+    def _test(channel_id: int) -> dict:
+        logger.info(f"Testing channel {channel_id}...")
+        result = test_channel(channel_id, model)
+        result["id"] = channel_id
+        return result
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = await asyncio.gather(*[
+            loop.run_in_executor(executor, _test, channel_id)
+            for channel_id in channel_ids
+        ])
+
+    success_count = sum(1 for result in results if result.get("success"))
+    return {
+        "total": len(channel_ids),
+        "success_count": success_count,
+        "failed_count": len(channel_ids) - success_count,
+        "results": results,
+    }
+
+
+def test_channels_batch(channel_ids: list[int], model: str = "", max_workers: int = 10) -> dict:
+    """批量并发测试多个渠道（同步入口；事件循环内请 await async_test_channels_batch）。"""
     try:
-        return asyncio.run(_run())
+        asyncio.get_running_loop()
     except RuntimeError:
-        # 已在事件循环中时，退回顺序逻辑（由 bot 层优先用并发路径）
-        results = []
-        success_count = 0
-        failed_count = 0
-        for channel_id in channel_ids:
-            result = test_channel(channel_id, model)
-            result["id"] = channel_id
-            results.append(result)
-            if result["success"]:
-                success_count += 1
-            else:
-                failed_count += 1
-        return {
-            "total": len(channel_ids),
-            "success_count": success_count,
-            "failed_count": failed_count,
-            "results": results,
-        }
+        return asyncio.run(async_test_channels_batch(channel_ids, model, max_workers=max_workers))
+
+    logger.warning("test_channels_batch called inside a running event loop; falling back to sequential tests")
+    results = []
+    for channel_id in channel_ids:
+        result = test_channel(channel_id, model)
+        result["id"] = channel_id
+        results.append(result)
+    success_count = sum(1 for result in results if result.get("success"))
+    return {
+        "total": len(channel_ids),
+        "success_count": success_count,
+        "failed_count": len(channel_ids) - success_count,
+        "results": results,
+    }
 
 
 def set_channel_status(channel_id: int, status: int) -> dict:
