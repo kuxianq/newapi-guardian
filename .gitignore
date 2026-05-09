@@ -8,27 +8,26 @@ __pycache__/
 venv/
 ENV/
 
-# 敏感信息
+# Secrets / local env
 .env
 *.env
 *.key
 *.pem
 credentials/
 
-# 运行数据
+# Runtime data
 data/
 *.db
 *.sqlite
 *.sqlite3
 *.log
+backups/
 
-# IDE
+# IDE / OS
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
 Thumbs.db

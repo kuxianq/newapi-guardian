@@ -1,13 +1,15 @@
 """工具执行器 - 统一路由、权限检查和结果格式化"""
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
 from core.database import execute_readonly_sql
-from core.formatter import format_kv, format_list, format_table, truncate
+from core.diagnostics import diagnose_failure_scope
 from core.http_client import call_api
+from core.newapi_version import detect_newapi_version
+from skills.newapi import get_newapi_docs
+from tools_new.formatter import format_tool_output
 from tools_new.registry import get_registry
 
 logger = logging.getLogger("guardian.tools.executor")
@@ -23,11 +25,8 @@ class ToolExecutor:
     def __init__(self):
         self.registry = get_registry()
 
-    def get_permission(self, tool_name: str) -> str:
-        tool = self.registry.get_tool(tool_name)
-        if not tool:
-            return "forbidden"
-        return tool.get("permission", "forbidden")
+    def get_permission(self, tool_name: str, arguments: dict[str, Any] | None = None) -> str:
+        return self.registry.permission_for(tool_name, arguments)
 
     def execute(self, tool_name: str, arguments: dict[str, Any] | None = None, *, require_confirmation: bool = False) -> dict[str, Any]:
         arguments = arguments or {}
@@ -35,9 +34,9 @@ class ToolExecutor:
         if not tool:
             return self._result(False, tool_name, arguments, error=f"未知工具: {tool_name}")
 
-        permission = tool.get("permission", "forbidden")
+        permission = self.registry.permission_for(tool_name, arguments)
         if permission == "forbidden":
-            return self._result(False, tool_name, arguments, error=f"工具 {tool_name} 被禁止使用", permission=permission)
+            return self._result(False, tool_name, arguments, error=f"工具 {tool_name} 当前调用被禁止", permission=permission)
 
         if permission == "confirm" and not require_confirmation:
             return self._result(
@@ -55,6 +54,17 @@ class ToolExecutor:
                     sql=str(arguments.get("sql", "")).strip(),
                     limit=int(arguments.get("limit", 100)),
                 )
+            elif tool_name == "diagnose_newapi_failure":
+                raw = diagnose_failure_scope(
+                    model=arguments.get("model") or None,
+                    channel_id=arguments.get("channel_id"),
+                    minutes=int(arguments.get("minutes", 60)),
+                    include_recent=bool(arguments.get("include_recent", True)),
+                )
+            elif tool_name == "get_newapi_runtime_info":
+                raw = detect_newapi_version()
+            elif tool_name == "get_newapi_docs":
+                raw = get_newapi_docs(arguments.get("topic"))
             elif tool_name == "call_api":
                 raw = call_api(
                     method=str(arguments.get("method", "GET")).upper(),
@@ -70,7 +80,7 @@ class ToolExecutor:
                 arguments,
                 permission=permission,
                 data=raw,
-                output=self._format_output(tool_name, raw),
+                output=format_tool_output(tool_name, raw),
                 error=raw.get("error"),
             )
         except Exception as exc:
@@ -93,49 +103,12 @@ class ToolExecutor:
             "success": success,
             "tool": tool_name,
             "arguments": arguments,
-            "permission": permission or self.get_permission(tool_name),
+            "permission": permission or self.get_permission(tool_name, arguments),
             "needs_confirmation": needs_confirmation,
             "data": data,
             "output": output or (f"❌ {error}" if error else ""),
             "error": error,
         }
-
-    def _format_output(self, tool_name: str, raw: dict[str, Any]) -> str:
-        if not raw.get("success"):
-            return f"❌ {raw.get('error', '执行失败')}"
-
-        if tool_name == "query_database":
-            rows = raw.get("data") or []
-            if not rows:
-                return "✅ 查询成功，但没有返回数据。"
-
-            table = format_table(rows, max_width=40)
-            suffix = []
-            if raw.get("limited"):
-                suffix.append(f"⚠️ 结果已按安全上限截断，当前返回 {raw.get('row_count', len(rows))} 行")
-            else:
-                suffix.append(f"✅ 查询成功，共返回 {raw.get('row_count', len(rows))} 行")
-            return table + "\n\n" + "\n".join(suffix)
-
-        if tool_name == "call_api":
-            parts = ["✅ API 调用完成"]
-            if "status_code" in raw:
-                parts.append(f"HTTP {raw['status_code']}")
-            payload = raw.get("data")
-            if isinstance(payload, dict):
-                parts.append("")
-                parts.append(format_kv(payload, title="返回数据"))
-            elif isinstance(payload, list):
-                parts.append("")
-                parts.append(format_list(payload[:20]))
-                if len(payload) > 20:
-                    parts.append(f"\n... 还有 {len(payload) - 20} 项")
-            elif payload is not None:
-                parts.append("")
-                parts.append(truncate(json.dumps(payload, ensure_ascii=False), 1200))
-            return "\n".join(parts)
-
-        return truncate(json.dumps(raw, ensure_ascii=False, indent=2), 2000)
 
 
 _executor: ToolExecutor | None = None

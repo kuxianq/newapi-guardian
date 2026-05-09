@@ -1,0 +1,16 @@
+[Unit]
+Description=NewAPI Guardian Bot
+After=network-online.target mysql.service docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/newapi-guardian
+EnvironmentFile=/opt/newapi-guardian/.env
+ExecStart=/opt/newapi-guardian/.venv/bin/python /opt/newapi-guardian/bot.py
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
