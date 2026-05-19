@@ -1,40 +1,49 @@
 """NewAPI Guardian Bot - Telegram Bot 主入口 v2"""
 import logging
-import asyncio
+from datetime import datetime, timedelta
 from pathlib import PurePath
 from uuid import uuid4
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes,
-    ConversationHandler, MessageHandler, filters,
+    MessageHandler, filters,
 )
-from telegram.constants import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from async_utils import run_blocking, run_many_blocking
 from config import (
     BOT_TOKEN, AUTHORIZED_IDS, CHECK_INTERVAL_MINUTES, DAILY_REPORT_HOUR,
-    BACKUP_DIR,
 )
 import db as newapi_db
 from formatter import (
     fmt_overview, fmt_model_query, fmt_channel_detail,
     fmt_slow_channels, fmt_batch_status_result, fmt_disable_failed_preview,
-    truncate, ts_to_str, safe_text, fmt_alert, fmt_recovery, fmt_health_score,
+    truncate, safe_text, fmt_alert, fmt_recovery,
     fmt_recent_logs,
 )
+from agent_memory_maintenance import get_memory_status
+from handlers.memory import (
+    cmd_memory_compact,
+    cmd_memory_status,
+    compact_all_memories,
+    format_memory_compact_result,
+    format_memory_status,
+)
+from handlers.usage import cmd_usage_summary
 from menus import (
-    ai_menu_kb,
     back_btn,
     channels_menu_kb,
-    data_menu_kb,
-    diagnose_menu_kb,
     main_menu_kb as build_main_menu_kb,
-    newapi_docs_menu_kb,
-    stats_menu_kb,
     status_kb,
-    status_menu_kb,
 )
-from backup import create_backup, list_backups, restore_backup
+from auth import authorized
+from backup import create_backup, list_backups
+from callbacks.ai_config import handle_ai_callback
+from callbacks.channel import handle_channel_callback
+from callbacks.confirm import handle_confirm_callback
+from callbacks.diagnose import handle_diagnose_callback
+from callbacks.menu import handle_backup_callback, handle_menu_callback
+from callbacks.stats import build_overview_text, handle_stats_callback
 from newapi_client import test_channel as api_test_channel, async_test_channels_batch, set_channel_status as api_set_channel_status
 from core.diagnostics import diagnose_failure_scope
 from tools_new.formatter import format_tool_output
@@ -51,7 +60,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger("guardian")
 
-BOT_VERSION = "v2.3.0"
+BOT_VERSION = "v2.4.0"
+
+# Confirmation callbacks expire to avoid stale high-risk actions.
+CONFIRM_EXPIRES_MINUTES = 10
 
 # 会话状态
 CONFIRM_RESTORE = 1
@@ -62,18 +74,65 @@ def _create_pending_restore(context: ContextTypes.DEFAULT_TYPE, filename: str) -
     """Store a validated restore target behind a short callback id."""
     restore_id = uuid4().hex[:12]
     pending = context.user_data.setdefault(PENDING_RESTORE_KEY, {})
-    pending[restore_id] = filename
+    pending[restore_id] = {
+        "filename": filename,
+        "expires_at": (datetime.now() + timedelta(minutes=CONFIRM_EXPIRES_MINUTES)).isoformat(),
+    }
     return restore_id
 
 
 def _pop_valid_pending_restore(context: ContextTypes.DEFAULT_TYPE, restore_id: str) -> str | None:
-    """Return a pending restore filename only if it is still in the known backup list."""
+    """Return a pending restore filename only if it is still valid."""
     pending = context.user_data.get(PENDING_RESTORE_KEY, {})
-    filename = pending.pop(restore_id, None)
+    item = pending.pop(restore_id, None)
+    if isinstance(item, str):  # backward compatibility for old in-memory entries
+        filename = item
+        expires_at = None
+    elif isinstance(item, dict):
+        filename = item.get("filename")
+        expires_at = item.get("expires_at")
+    else:
+        return None
+    if expires_at:
+        try:
+            if datetime.fromisoformat(expires_at) < datetime.now():
+                return None
+        except ValueError:
+            return None
     if not filename or PurePath(filename).name != filename:
         return None
     known_names = {backup["filename"] for backup in list_backups()}
     return filename if filename in known_names else None
+
+
+def _make_timed_callback(context: ContextTypes.DEFAULT_TYPE, action: str, payload: str) -> str:
+    """Build callback_data with an embedded expiry timestamp.
+
+    Telegram callback_data is limited, so this keeps the format compact while
+    making stale confirm buttons harmless.
+    """
+    expires_ts = int((datetime.now() + timedelta(minutes=CONFIRM_EXPIRES_MINUTES)).timestamp())
+    return f"{action}:{expires_ts}:{payload}"
+
+
+def _parse_timed_callback(data: str, action: str) -> tuple[bool, str]:
+    prefix = f"{action}:"
+    if data.startswith(prefix):
+        rest = data[len(prefix):]
+        try:
+            expires_ts_str, payload = rest.split(":", 1)
+            expires_ts = int(expires_ts_str)
+        except ValueError:
+            return False, ""
+        if expires_ts < int(datetime.now().timestamp()):
+            return False, payload
+        return True, payload
+
+    # Compatibility with pre-v2.4 in-memory buttons, useful during rolling restarts.
+    legacy_prefix = f"{action}_"
+    if data.startswith(legacy_prefix):
+        return True, data[len(legacy_prefix):]
+    return False, ""
 
 
 def _parse_channel_ids(args: list[str]) -> list[int]:
@@ -129,19 +188,6 @@ async def _execute_batch_status(update_or_query, channel_ids: list[int], new_sta
         await safe_reply(update_or_query, text, reply_markup=back_btn())
 
 
-# ── 权限 ──
-def authorized(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id if update.effective_user else 0
-        if uid not in AUTHORIZED_IDS:
-            msg = update.effective_message or (update.callback_query and update.callback_query.message)
-            if msg:
-                await safe_reply(msg, "⛔ 无权限。")
-            return
-        return await func(update, context)
-    return wrapper
-
-
 # ── 菜单 ──
 def main_menu_kb():
     return build_main_menu_kb(get_mode_enabled())
@@ -157,17 +203,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @authorized
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update.message, "🤖 *NewAPI Guardian*\n━━━━━━━━━━━━━━━━━━\n📊 监控 · 管理 · 备份\n━━━━━━━━━━━━━━━━━━\n💕 Made with love by Rem", reply_markup=main_menu_kb())
-
-
-def build_overview_text(minutes: int = 60) -> str:
-    """Build the richer status overview shared by /status and inline buttons."""
-    stats = newapi_db.get_overview_stats(minutes=minutes)
-    fail_ch = newapi_db.get_channel_failure_stats(minutes=minutes)
-    fail_m = newapi_db.get_model_failure_stats(minutes=minutes)
-    today = newapi_db.get_today_stats()
-    slow = newapi_db.get_slow_channels(minutes=minutes)
-    balance = newapi_db.get_balance_suspect_channels(minutes=120)
-    return fmt_overview(stats, fail_ch, fail_m, today, slow, balance)
 
 
 @authorized
@@ -247,30 +282,27 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await safe_reply(update.message, "用法:\n`/test 105` — 测试单渠道\n`/test 105 106 107` — 批量测试多个渠道\n`/test_model gpt-5.4` — 测试某模型所有渠道\n`/test_all` — 测试全部启用渠道")
         return
-    
-    # 解析渠道 ID 列表
-    channel_ids = []
-    for arg in context.args:
-        try:
-            cid = int(arg)
-            channel_ids.append(cid)
-        except ValueError:
-            await safe_reply(update.message, f"❌ 无效的渠道 ID: `{arg}`")
-            return
-    
+
+    try:
+        channel_ids = _parse_channel_ids(context.args)
+    except ValueError:
+        await safe_reply(update.message, "❌ 渠道 ID 必须是数字。")
+        return
+
     if not channel_ids:
         await safe_reply(update.message, "❌ 请输入至少一个渠道 ID。")
         return
-    
-    # 单个渠道测试（保留原有详细输出）
+
+    channels_by_id = {cid: newapi_db.get_channel_by_id(cid) for cid in channel_ids}
+
     if len(channel_ids) == 1:
         cid = channel_ids[0]
-        ch = newapi_db.get_channel_by_id(cid)
+        ch = channels_by_id.get(cid)
         if not ch:
             await safe_reply(update.message, f"❌ 渠道 {cid} 不存在。")
             return
         msg = await safe_reply(update.message, f"🧪 正在测试渠道 `{safe_text(ch.get('name',''))}` (ID:{cid})...")
-        result = api_test_channel(cid, ch.get("test_model", ""))
+        result = await run_blocking(api_test_channel, cid, ch.get("test_model", ""))
         icon = "✅" if result["success"] else "❌"
         text = (
             f"{icon} *渠道测试结果*\n\n"
@@ -282,43 +314,47 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"信息: {safe_text(str(result['message'])[:100])}"
         await safe_edit(msg, text, reply_markup=back_btn())
         return
-    
-    # 批量测试
+
+    existing_ids = [cid for cid in channel_ids if channels_by_id.get(cid)]
+    missing_ids = [cid for cid in channel_ids if not channels_by_id.get(cid)]
+    if not existing_ids:
+        await safe_reply(update.message, "❌ 输入的渠道都不存在。", reply_markup=back_btn())
+        return
+
     msg = await safe_reply(
         update.message,
-        f"🧪 正在批量测试 {len(channel_ids)} 个渠道，请稍候...",
+        f"🧪 正在批量测试 {len(existing_ids)} 个渠道，请稍候...",
     )
-    
-    # 调用批量测试 API
-    batch_result = await async_test_channels_batch(channel_ids)
-    
-    # 格式化结果
+
+    batch_result = await async_test_channels_batch(existing_ids)
+
     lines = [
         f"🧪 *批量渠道测试*\n",
         f"✅ 成功: {batch_result['success_count']} | ❌ 失败: {batch_result['failed_count']}\n",
     ]
-    
-    # 先列失败的
+    if missing_ids:
+        lines.append("*不存在渠道:*")
+        lines.append("  " + ", ".join(map(str, missing_ids)))
+
     failed = [r for r in batch_result['results'] if not r['success']]
     if failed:
         lines.append("*失败渠道:*")
         for r in failed:
-            ch = newapi_db.get_channel_by_id(r['id'])
+            ch = channels_by_id.get(r['id'])
             name = truncate(ch.get('name', '') if ch else f"ID:{r['id']}", 25)
             msg_text = truncate(str(r.get('message', '')), 30)
             lines.append(f"  ❌ `{name}` (ID:{r['id']}) {r.get('time',0):.1f}s")
             if msg_text:
                 lines.append(f"     {msg_text}")
-    
-    # 再列成功的
+
     passed = [r for r in batch_result['results'] if r['success']]
     if passed:
         lines.append(f"\n*成功渠道 ({len(passed)}个):*")
         for r in passed:
-            ch = newapi_db.get_channel_by_id(r['id'])
+            ch = channels_by_id.get(r['id'])
             name = truncate(ch.get('name', '') if ch else f"ID:{r['id']}", 25)
             lines.append(f"  ✅ `{name}` (ID:{r['id']}) {r.get('time',0):.1f}s")
-    
+
     await safe_edit(msg, "\n".join(lines), reply_markup=back_btn())
 
 
@@ -336,10 +372,11 @@ async def cmd_test_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update.message,
         f"🧪 正在测试模型 `{safe_text(model_name)}` 的 {len(channels)} 个渠道...",
     )
-    results = []
-    for ch in channels:
-        r = api_test_channel(ch["id"], model_name)
-        results.append((ch, r))
+    results = await run_many_blocking(
+        channels,
+        lambda ch: (ch, api_test_channel(ch["id"], model_name)),
+        max_workers=10,
+    )
     ok = sum(1 for _, r in results if r["success"])
     fail = len(results) - ok
     lines = [f"🧪 *模型测试: `{safe_text(model_name)}`*\n",
@@ -363,18 +400,11 @@ async def cmd_test_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧪 正在并发测试全部 {len(channels)} 个启用渠道，请稍候...",
     )
     
-    # 并发测试
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-    
-    def test_one(ch):
-        model = ch.get("test_model", "") or ""
-        return (ch, api_test_channel(ch["id"], model))
-    
-    loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        tasks = [loop.run_in_executor(executor, test_one, ch) for ch in channels]
-        results = await asyncio.gather(*tasks)
+    results = await run_many_blocking(
+        channels,
+        lambda ch: (ch, api_test_channel(ch["id"], ch.get("test_model", "") or "")),
+        max_workers=10,
+    )
     
     ok = sum(1 for _, r in results if r["success"])
     fail = len(results) - ok
@@ -456,7 +486,8 @@ async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update.message,
         f"⚠️ *确认恢复数据库？*\n\n"
         f"将恢复: `{safe_text(filename)}`\n"
-        f"恢复前会自动备份当前状态。\n\n"
+        f"恢复前会自动备份当前状态。\n"
+        f"确认有效期: `{CONFIRM_EXPIRES_MINUTES} 分钟`\n\n"
         f"⚠️ 这会覆盖当前数据库！",
         reply_markup=InlineKeyboardMarkup([
             [
@@ -490,9 +521,10 @@ async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚠️ *批量启用确认*\n\n"
         f"渠道数: `{affected_count}` / {len(ids)}\n"
         f"渠道ID: `{ids_str}`\n"
-        f"影响模型: {safe_text(model_text)}",
+        f"影响模型: {safe_text(model_text)}\n"
+        f"确认有效期: `{CONFIRM_EXPIRES_MINUTES} 分钟`",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ 确认启用", callback_data=f"confirm_enable_{ids_str}"),
+            InlineKeyboardButton("✅ 确认启用", callback_data=_make_timed_callback(context, "confirm_enable", ids_str)),
             InlineKeyboardButton("❌ 取消", callback_data="menu"),
         ]]),
     )
@@ -514,9 +546,9 @@ async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
         models = ", ".join(_channel_models(ch)[:12]) if ch else "无"
         await safe_reply(
             update.message,
-            f"⚠️ *禁用确认*\n\n渠道: `{safe_text(_channel_label(ch, cid))}` (ID:{cid})\n影响模型: {safe_text(models or '无')}",
+            f"⚠️ *禁用确认*\n\n渠道: `{safe_text(_channel_label(ch, cid))}` (ID:{cid})\n影响模型: {safe_text(models or '无')}\n确认有效期: `{CONFIRM_EXPIRES_MINUTES} 分钟`",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ 确认禁用", callback_data=f"confirm_disable_{cid}"),
+                InlineKeyboardButton("✅ 确认禁用", callback_data=_make_timed_callback(context, "confirm_disable", str(cid))),
                 InlineKeyboardButton("❌ 取消", callback_data="menu"),
             ]]),
         )
@@ -531,9 +563,10 @@ async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚠️ *批量禁用确认*\n\n"
         f"渠道数: `{affected_count}` / {len(ids)}\n"
         f"渠道ID: `{ids_str}`\n"
-        f"影响模型: {safe_text(model_text)}",
+        f"影响模型: {safe_text(model_text)}\n"
+        f"确认有效期: `{CONFIRM_EXPIRES_MINUTES} 分钟`",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ 确认禁用", callback_data=f"confirm_disable_{ids_str}"),
+            InlineKeyboardButton("✅ 确认禁用", callback_data=_make_timed_callback(context, "confirm_disable", ids_str)),
             InlineKeyboardButton("❌ 取消", callback_data="menu"),
         ]]),
     )
@@ -558,9 +591,9 @@ async def cmd_disable_failed(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ids_str = ",".join(map(str, ids))
     await safe_reply(
         update.message,
-        preview,
+        preview + f"\n\n确认有效期: `{CONFIRM_EXPIRES_MINUTES} 分钟`",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ 确认一键禁用", callback_data=f"confirm_disable_failed_{threshold}_{ids_str}"),
+            InlineKeyboardButton("✅ 确认一键禁用", callback_data=_make_timed_callback(context, "confirm_disable_failed", f"{threshold}_{ids_str}")),
             InlineKeyboardButton("❌ 取消", callback_data="menu"),
         ]]),
     )
@@ -618,6 +651,7 @@ async def cmd_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update.message, text, reply_markup=back_btn())
 
 
+
 @authorized
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -627,7 +661,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /model `名称` — 🧩 按模型查\n"
         "  /channel `ID` — 🔌 按渠道查\n"
         "  /slow — 🐢 慢渠道排行\n"
-        "  /report — 📋 24h 汇总\n\n"
+        "  /report — 📋 24h 汇总\n"
+        "  /usage\\_summary — 📊 Token/用量统计\n\n"
         "*渠道测试*\n"
         "  /test `ID` — 🧪 测试单渠道\n"
         "  /test\\_model `名称` — 🧪 按模型测试\n"
@@ -638,7 +673,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*数据安全*\n"
         "  /backup — 💾 备份数据库\n"
         "  /backup\\_list — 📂 备份列表\n"
-        "  /restore `文件名` — ♻️ 恢复数据库\n\n"
+        "  /restore `文件名` — ♻️ 恢复数据库\n"
+        "  /memory\\_status — 🧠 Agent 记忆状态\n"
+        "  /memory\\_compact — 🧹 记忆整理 dry-run\n\n"
         "*其他*\n"
         "  /menu — 📱 主菜单\n"
         "  /help — 📖 帮助\n"
@@ -793,267 +830,63 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data
 
-    text = None
+    text: str | None = None
     markup = back_btn()
 
-    if data == "menu":
+    stats_result = handle_stats_callback(data)
+    if stats_result:
+        text, markup = stats_result
+
+    elif data == "menu":
         await safe_edit(q, "🤖 *NewAPI Guardian*\n━━━━━━━━━━━━━━━━━━\n📊 监控 · 管理 · 备份\n━━━━━━━━━━━━━━━━━━\n💕 Made with love by Rem", reply_markup=main_menu_kb())
         return
 
-    elif data == "ai_mode_toggle":
-        enabled = not get_mode_enabled()
-        set_mode_enabled(enabled)
-        status = "开启" if enabled else "关闭"
-        text = f"🤖 AI 对话模式已切换为: *{status}*\n\n{'现在所有非命令文本都会交给 AI 处理。' if enabled else '现在只有 `@ai` 前缀消息会交给 AI 处理。'}"
-        markup = ai_menu_kb()
-
-    elif data == "menu_status":
-        text = (
-            "📊 *状态中心*\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "这里放总览、Console、今日统计和 24h 汇总。"
-        )
-        markup = status_menu_kb()
-
-    elif data == "menu_diagnose":
-        text = (
-            "🔎 *智能诊断*\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "用于定位模型失败、渠道异常、余额/预扣费问题和 fallback 原因。"
-        )
-        markup = diagnose_menu_kb()
-
-    elif data == "menu_stats":
-        text = (
-            "📈 *统计报表*\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "这里放使用量、排行、慢请求和日志入口。"
-        )
-        markup = stats_menu_kb()
-
-    elif data == "menu_channels":
-        text = (
-            "🔧 *渠道管理*\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "这里放渠道查询、测试、启用/禁用和异常处理入口。\n\n"
-            "💡 添加、编辑、删除渠道仍建议在 NewAPI 网页端操作。"
-        )
-        markup = channels_menu_kb()
-
-    elif data == "menu_data":
-        text = (
-            "💾 *数据安全*\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "这里放备份、备份列表和恢复说明。\n\n"
-            "⚠️ 恢复数据库属于高风险操作，仍需要二次确认。"
-        )
-        markup = data_menu_kb()
-
-    elif data == "menu_ai":
-        cfg = load_config()
-        raw_key = cfg.get("key", "") or ""
-        if len(raw_key) > 10:
-            masked_key = f"{raw_key[:6]}...{raw_key[-4:]}"
-        elif raw_key:
-            masked_key = raw_key[:3] + "***"
+    elif data == "ai_mode_toggle" or data == "menu_ai" or data == "ai_config_menu" or data.startswith("ai_set_") or data in {"ai_enable", "ai_disable"}:
+        ai_result = handle_ai_callback(data)
+        if ai_result is not None:
+            text, markup = ai_result
         else:
-            masked_key = "未设置"
-        text = (
-            "🤖 *AI 设置*\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            f"AI 功能: {'已启用 ✅' if cfg.get('enabled') else '未启用 ❌'}\n"
-            f"对话模式: {'开启 ✅' if get_mode_enabled() else '关闭 ❌'}\n"
-            f"模型: `{safe_text(cfg.get('model') or '未设置')}`\n"
-            f"Key: `{safe_text(masked_key)}`"
-        )
-        markup = ai_menu_kb()
+            text = "未知操作。"
 
-    elif data.startswith("diagnose_model:"):
-        model = data.split(":", 1)[1]
-        raw = diagnose_failure_scope(model=model, minutes=60, include_recent=True)
-        text = format_tool_output("diagnose_newapi_failure", raw)
-        markup = back_btn("menu_diagnose")
-
-    elif data == "diagnose_balance":
-        raw = diagnose_failure_scope(minutes=120, include_recent=True)
-        text = format_tool_output("diagnose_newapi_failure", raw)
-        markup = back_btn("menu_diagnose")
-
-    elif data == "diagnose_model_prompt":
-        text = "🧩 *按模型诊断*\n\n请发送：\n`/diagnose gpt-5.5`\n`/diagnose claude-opus-4-7`\n\n也可以指定时间：\n`/diagnose gpt-5.5 90`"
-        markup = diagnose_menu_kb()
-
-    elif data == "diagnose_channel_prompt":
-        text = "🔌 *按渠道诊断*\n\n请发送：\n`/diagnose 266`\n\n也可以指定时间：\n`/diagnose 266 90`"
-        markup = diagnose_menu_kb()
-
-    elif data == "newapi_docs_menu":
-        text = "📚 *NewAPI 文档参考*\n\n选择一个主题查看。真实状态仍以当前实例数据库 / API 为准。"
-        markup = newapi_docs_menu_kb()
-
-    elif data.startswith("newapi_docs:"):
-        from skills.newapi import get_newapi_docs
-        topic = data.split(":", 1)[1]
-        text = format_tool_output("get_newapi_docs", get_newapi_docs(topic))
-        markup = back_btn("newapi_docs_menu")
-
-    elif data == "ai_config_menu":
-        cfg = load_config()
-        raw_key = cfg.get("key", "") or ""
-        if len(raw_key) > 10:
-            masked_key = f"{raw_key[:6]}...{raw_key[-4:]}"
-        elif raw_key:
-            masked_key = raw_key[:3] + "***"
+    elif data in {"menu_status", "menu_diagnose", "menu_stats", "menu_channels", "menu_data", "menu_memory", "model_prompt", "channel_prompt", "test_prompt", "test_model_prompt", "enable_prompt", "disable_prompt", "disable_failed_prompt", "restore_prompt"}:
+        menu_result = handle_menu_callback(data)
+        if menu_result is not None:
+            menu_text, kb_factory = menu_result
+            text = menu_text
+            markup = kb_factory()
         else:
-            masked_key = "未设置"
+            text = "未知操作。"
 
-        text = (
-            "🤖 *AI 配置*\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            f"状态: {'已启用 ✅' if cfg.get('enabled') else '未启用 ❌'}\n"
-            f"API: `{safe_text(cfg.get('url') or '未设置')}`\n"
-            f"模型: `{safe_text(cfg.get('model') or '未设置')}`\n"
-            f"Key: `{safe_text(masked_key)}`"
-        )
-        markup = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📝 修改 URL", callback_data="ai_set_url"),
-                InlineKeyboardButton("🔑 修改 Key", callback_data="ai_set_key"),
-            ],
-            [
-                InlineKeyboardButton("🤖 修改模型", callback_data="ai_set_model"),
-                InlineKeyboardButton("✅ 启用", callback_data="ai_enable"),
-                InlineKeyboardButton("❌ 禁用", callback_data="ai_disable"),
-            ],
-            [InlineKeyboardButton("🔙 返回 AI 设置", callback_data="menu_ai")],
-        ])
-
-    elif data == "ai_set_url":
-        text = "📝 请使用命令设置 AI URL：\n`/ai_config set_url <URL>`"
-
-    elif data == "ai_set_key":
-        text = "🔑 请使用命令设置 AI Key：\n`/ai_config set_key <KEY>`"
-
-    elif data == "ai_set_model":
-        text = "🤖 请使用命令设置 AI 模型：\n`/ai_config set_model <MODEL>`"
-
-    elif data == "ai_enable":
-        ai_set_enabled(True)
-        text = "✅ AI 功能已启用。"
-        markup = back_btn()
-
-    elif data == "ai_disable":
-        ai_set_enabled(False)
-        text = "❌ AI 功能已禁用。"
-        markup = back_btn()
-
-    elif data == "overview":
-        text = build_overview_text(minutes=60)
-
-    elif data == "slow":
-        slow = newapi_db.get_slow_channels(minutes=60)
-        text = fmt_slow_channels(slow)
-
-    elif data == "report":
-        stats = newapi_db.get_overview_stats(minutes=1440)
-        fail_ch = newapi_db.get_channel_failure_stats(minutes=1440)
-        fail_m = newapi_db.get_model_failure_stats(minutes=1440)
-        today = newapi_db.get_today_stats()
-        slow = newapi_db.get_slow_channels(minutes=1440)
-        balance = newapi_db.get_balance_suspect_channels(minutes=1440)
-        text = fmt_overview(stats, fail_ch, fail_m, today, slow, balance).replace("最近 1h", "最近 24h")
-
-    elif data == "recent_logs":
-        logs = newapi_db.get_recent_logs(limit=10)
-        text = fmt_recent_logs(logs)
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 刷新", callback_data="recent_logs")],
-            [InlineKeyboardButton("🔙 返回统计报表", callback_data="menu_stats")],
-        ])
-
-    elif data == "model_prompt":
-        text = "🧩 *按模型查询*\n\n请发送模型名称：\n`/model gpt-5.4`"
-        markup = channels_menu_kb()
-
-    elif data == "channel_prompt":
-        text = "🔌 *按渠道查询*\n\n请发送渠道 ID：\n`/channel 105`"
-        markup = channels_menu_kb()
-
-    elif data == "enable_prompt":
-        text = "🟢 *启用渠道*\n\n请发送：\n`/enable 渠道ID`\n\n多个渠道可以空格分隔：\n`/enable 101 102 103`"
-        markup = channels_menu_kb()
-
-    elif data == "disable_prompt":
-        text = "🔴 *禁用渠道*\n\n请发送：\n`/disable 渠道ID`\n\n多个渠道可以空格分隔：\n`/disable 101 102 103`"
-        markup = channels_menu_kb()
-
-    elif data == "disable_failed_prompt":
-        text = "⚠️ *一键禁用失败渠道*\n\n请发送：\n`/disable_failed`\n\n也可以指定失败阈值：\n`/disable_failed 5`"
-        markup = channels_menu_kb()
-
-    elif data == "restore_prompt":
-        text = "♻️ *恢复数据库*\n\n先查看备份：\n`/backup_list`\n\n再发送：\n`/restore 文件名`\n\n⚠️ 恢复会覆盖当前数据库，执行前会再次确认。"
-        markup = data_menu_kb()
-
-    elif data == "backup":
-        await safe_edit(q, "💾 正在备份数据库...")
-        ok, info, filepath = create_backup(tag="manual")
-        if ok:
-            text = f"✅ {info}"
-            if filepath and filepath.stat().st_size < 50 * 1024 * 1024:
-                try:
-                    await q.message.reply_document(
-                        document=open(filepath, "rb"),
-                        filename=filepath.name,
-                        caption="💾 NewAPI 数据库备份",
-                    )
-                except Exception as e:
-                    text += f"\n⚠️ 文件发送失败: {e}"
+    elif data.startswith("diagnose_") or data == "newapi_docs_menu" or data.startswith("newapi_docs:"):
+        diagnose_result = handle_diagnose_callback(data)
+        if diagnose_result is not None:
+            text, markup = diagnose_result
         else:
-            text = f"❌ {info}"
+            text = "未知操作。"
 
-    elif data == "backup_list":
-        backups = list_backups()
-        if not backups:
-            text = "📂 没有找到备份文件。"
+    elif data in {"backup", "backup_list"}:
+        backup_text, backup_handled = await handle_backup_callback(q, data)
+        if backup_handled:
+            text = backup_text
         else:
-            lines = ["📂 *备份列表*\n"]
-            for i, b in enumerate(backups[:15], 1):
-                lines.append(f"  {i}. `{b['filename']}`\n     {b['created']} | {b['size_mb']}MB")
-            lines.append(f"\n共 {len(backups)} 份备份")
-            lines.append("\n恢复: `/restore 文件名`")
-            text = "\n".join(lines)
+            text = "未知操作。"
 
-    elif data == "console":
-        from formatter import fmt_console
-        stats = newapi_db.get_today_stats()
-        today_models = newapi_db.get_today_model_usage(15)
-        all_models = newapi_db.get_model_usage_stats(0, 10)
-        users = newapi_db.get_user_usage_stats(5)
-        tokens = newapi_db.get_token_usage_stats(5)
-        text = fmt_console(stats, today_models, all_models, users, tokens)
 
-    elif data == "today":
-        from formatter import fmt_today_stats
-        stats = newapi_db.get_today_stats()
-        yesterday_stats = newapi_db.get_yesterday_stats()
-        models = newapi_db.get_today_model_usage(15)
-        text = fmt_today_stats(stats, models, yesterday_stats)
+    elif data == "usage_summary_btn":
+        from core.usage_summary import get_usage_summary
+        raw = get_usage_summary(scope="all", group_by="model", limit=10)
+        text = format_tool_output("get_usage_summary", raw)
+        markup = back_btn("menu_stats")
 
-    elif data == "models":
-        from formatter import fmt_model_usage
-        all_models = newapi_db.get_model_usage_stats(0, 20)
-        text = fmt_model_usage(all_models, "模型使用排行（全部时间）")
+    elif data == "memory_status_btn":
+        status = get_memory_status()
+        text = format_memory_status(status)
+        markup = back_btn("menu_memory")
 
-    elif data == "users":
-        from formatter import fmt_user_usage
-        users_data = newapi_db.get_user_usage_stats(10)
-        text = fmt_user_usage(users_data)
-
-    elif data == "tokens":
-        from formatter import fmt_token_usage
-        tokens_data = newapi_db.get_token_usage_stats(10)
-        text = fmt_token_usage(tokens_data)
+    elif data == "memory_compact_btn":
+        result = compact_all_memories(dry_run=True, keep_recent_facts=200)
+        text = format_memory_compact_result(result) + "\n\nℹ️ 按钮只走 dry-run，如需真正写盘请使用 `/memory_compact apply`。"
+        markup = back_btn("menu_memory")
 
     elif data == "help_prompt":
         text = (
@@ -1164,115 +997,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💕 Made with love by Rem"
         )
 
-    elif data == "test_all":
-        await safe_edit(q, "🧪 正在并发测试全部启用渠道，请稍候...")
-        channels = newapi_db.get_enabled_channels()
-        
-        # 并发测试
-        import asyncio
-        from concurrent.futures import ThreadPoolExecutor
-        
-        def test_one(ch):
-            model = ch.get("test_model", "") or ""
-            return (ch, api_test_channel(ch["id"], model))
-        
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            tasks = [loop.run_in_executor(executor, test_one, ch) for ch in channels]
-            results = await asyncio.gather(*tasks)
-        
-        ok_count = sum(1 for _, r in results if r["success"])
-        fail_count = len(results) - ok_count
-        lines = [f"🧪 *全量渠道测试*\n", f"✅ 成功: {ok_count} | ❌ 失败: {fail_count}\n"]
-        failed = [(ch, r) for ch, r in results if not r["success"]]
-        if failed:
-            lines.append("*失败渠道:*")
-            for ch, r in failed:
-                name = truncate(ch.get("name", ""), 25)
-                lines.append(f"  ❌ `{name}` (ID:{ch['id']}) {r.get('time',0):.1f}s")
-        passed = [(ch, r) for ch, r in results if r["success"]]
-        if passed:
-            lines.append(f"\n*成功渠道 ({len(passed)}个):*")
-            for ch, r in passed[:15]:
-                name = truncate(ch.get("name", ""), 25)
-                lines.append(f"  ✅ `{name}` (ID:{ch['id']}) {r.get('time',0):.1f}s")
-            if len(passed) > 15:
-                lines.append(f"  ... 还有 {len(passed)-15} 个")
-        text = "\n".join(lines)
+    elif data == "test_all" or (data.startswith("test_") and not data.startswith("test_all") and not data.startswith("test_prompt") and not data.startswith("test_model_prompt")) or data.startswith("toggle_"):
+        channel_text, channel_handled = await handle_channel_callback(q, data)
+        if channel_handled and channel_text is not None:
+            text = channel_text
+        elif not channel_handled:
+            text = "未知操作。"
 
-    elif data.startswith("test_") and not data.startswith("test_all"):
-        cid_str = data.replace("test_", "")
-        try:
-            cid = int(cid_str)
-        except ValueError:
-            text = "❌ 无效渠道 ID"
-        else:
-            ch = newapi_db.get_channel_by_id(cid)
-            if not ch:
-                text = f"❌ 渠道 {cid} 不存在。"
+    elif data.startswith("confirm_"):
+        confirm_text, confirm_handled = await handle_confirm_callback(
+            q,
+            context,
+            data,
+            parse_timed_callback=_parse_timed_callback,
+            execute_batch_status=_execute_batch_status,
+            pop_valid_pending_restore=_pop_valid_pending_restore,
+        )
+        if confirm_handled:
+            if confirm_text:
+                text = confirm_text
             else:
-                await safe_edit(q, f"🧪 正在测试渠道 {cid}...")
-                r = api_test_channel(cid, ch.get("test_model", ""))
-                icon = "✅" if r["success"] else "❌"
-                text = (
-                    f"{icon} *渠道测试结果*\n\n"
-                    f"渠道: `{safe_text(ch.get('name',''))}` (ID:{cid})\n"
-                    f"结果: {'成功' if r['success'] else '失败'}\n"
-                    f"耗时: {r.get('time', 0):.1f}s"
-                )
-                if r.get("message"):
-                    text += f"\n信息: {safe_text(str(r['message'])[:100])}"
-
-    elif data.startswith("toggle_"):
-        cid_str = data.replace("toggle_", "")
-        try:
-            cid = int(cid_str)
-        except ValueError:
-            text = "❌ 无效渠道 ID"
+                return
         else:
-            ch = newapi_db.get_channel_by_id(cid)
-            if not ch:
-                text = f"❌ 渠道 {cid} 不存在。"
-            else:
-                new_status = 2 if ch.get("status") == 1 else 1
-                result = api_set_channel_status(cid, new_status)
-                if result.get("success"):
-                    icon = "🟢" if new_status == 1 else "🔴"
-                    action = "启用" if new_status == 1 else "禁用"
-                    text = f"{icon} 渠道 `{safe_text(ch.get('name',''))}` (ID:{cid}) 已{action}。"
-                else:
-                    text = f"❌ 操作失败: {result.get('message', '')}"
-
-    elif data.startswith("confirm_enable_"):
-        ids = [int(x) for x in data.replace("confirm_enable_", "").split(",") if x]
-        await _execute_batch_status(q, ids, 1, edit=True)
-        return
-
-    elif data.startswith("confirm_disable_failed_"):
-        rest = data.removeprefix("confirm_disable_failed_")
-        threshold_str, ids_str = rest.split("_", 1)
-        int(threshold_str)  # validate callback shape; ids carry the actual operation target
-        ids = [int(x) for x in ids_str.split(",") if x]
-        await _execute_batch_status(q, ids, 2, edit=True)
-        return
-
-    elif data.startswith("confirm_disable_"):
-        ids = [int(x) for x in data.replace("confirm_disable_", "").split(",") if x]
-        await _execute_batch_status(q, ids, 2, edit=True)
-        return
-
-    elif data.startswith("confirm_restore:"):
-        restore_id = data.removeprefix("confirm_restore:")
-        filename = _pop_valid_pending_restore(context, restore_id)
-        if not filename:
-            text = "❌ 恢复确认已过期或备份文件无效，请重新执行 /restore。"
-        else:
-            await safe_edit(q, f"♻️ 正在恢复 `{safe_text(filename)}`...\n恢复前会自动备份当前状态。")
-            ok, info = restore_backup(filename)
-            if ok:
-                text = f"✅ {info}"
-            else:
-                text = f"❌ {info}"
+            text = "未知操作。"
 
     else:
         text = "未知操作。"
@@ -1309,37 +1056,43 @@ async def daily_report(app: Application):
 
 # ── 启动 ──
 
-async def post_init(app: Application):
-    commands = [
-        BotCommand("start", "🤖 主菜单"),
-        BotCommand("status", "📊 总览"),
-        BotCommand("model", "🧩 按模型查"),
-        BotCommand("channel", "🔌 按渠道查"),
-        BotCommand("slow", "🐢 慢渠道排行"),
-        BotCommand("test", "🧪 测试单渠道"),
-        BotCommand("test_model", "🧪 按模型测试"),
-        BotCommand("test_all", "🧪 测试全部渠道"),
-        BotCommand("backup", "💾 备份数据库"),
-        BotCommand("backup_list", "📂 备份列表"),
-        BotCommand("restore", "♻️ 恢复数据库"),
-        BotCommand("enable", "🟢 启用渠道"),
-        BotCommand("disable", "🔴 禁用渠道"),
-        BotCommand("disable_failed", "⚠️ 一键禁用失败渠道"),
-        BotCommand("console", "🖥️ Console面板"),
-        BotCommand("today", "📅 今日统计"),
-        BotCommand("models", "📊 模型排行"),
-        BotCommand("users", "👤 用户排行"),
-        BotCommand("tokens", "🔑 Token排行"),
-        BotCommand("report", "📋 24h 汇总"),
-        BotCommand("help", "📖 帮助"),
-        BotCommand("ping", "🏓 存活检查"),
-        BotCommand("menu", "📱 主菜单"),
-        BotCommand("ai_config", "🤖 AI配置"),
-        BotCommand("ai_mode", "🤖 AI模式开关"),
-        BotCommand("logs", "📋 使用日志"),
-        BotCommand("diagnose", "🔎 故障诊断"),
+def get_commands():
+    return [
+        ("start", "🤖 主菜单", cmd_start),
+        ("status", "📊 总览", cmd_status),
+        ("model", "🧩 按模型查", cmd_model),
+        ("channel", "🔌 按渠道查", cmd_channel),
+        ("slow", "🐢 慢渠道排行", cmd_slow),
+        ("test", "🧪 测试单渠道", cmd_test),
+        ("test_model", "🧪 按模型测试", cmd_test_model),
+        ("test_all", "🧪 测试全部渠道", cmd_test_all),
+        ("backup", "💾 备份数据库", cmd_backup),
+        ("backup_list", "📂 备份列表", cmd_backup_list),
+        ("restore", "♻️ 恢复数据库", cmd_restore),
+        ("enable", "🟢 启用渠道", cmd_enable),
+        ("disable", "🔴 禁用渠道", cmd_disable),
+        ("disable_failed", "⚠️ 一键禁用失败渠道", cmd_disable_failed),
+        ("console", "🖥️ Console面板", cmd_console),
+        ("today", "📅 今日统计", cmd_today),
+        ("models", "📊 模型排行", cmd_models),
+        ("users", "👤 用户排行", cmd_users),
+        ("tokens", "🔑 Token排行", cmd_tokens),
+        ("report", "📋 24h 汇总", cmd_report),
+        ("help", "📖 帮助", cmd_help),
+        ("ping", "🏓 存活检查", cmd_ping),
+        ("menu", "📱 主菜单", cmd_menu),
+        ("ai_config", "🤖 AI配置", cmd_ai_config),
+        ("ai_mode", "🤖 AI模式开关", cmd_ai_mode),
+        ("logs", "📋 使用日志", cmd_logs),
+        ("diagnose", "🔎 故障诊断", cmd_diagnose),
+        ("usage_summary", "📊 Token/用量统计", cmd_usage_summary),
+        ("memory_status", "🧠 Agent记忆状态", cmd_memory_status),
+        ("memory_compact", "🧹 Agent记忆整理", cmd_memory_compact),
     ]
-    await app.bot.set_my_commands(commands)
+
+
+async def post_init(app: Application):
+    await app.bot.set_my_commands([BotCommand(name, desc) for name, desc, _ in get_commands()])
     logger.info("Bot commands registered.")
 
     scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
@@ -1392,33 +1145,8 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("model", cmd_model))
-    app.add_handler(CommandHandler("channel", cmd_channel))
-    app.add_handler(CommandHandler("slow", cmd_slow))
-    app.add_handler(CommandHandler("report", cmd_report))
-    app.add_handler(CommandHandler("test", cmd_test))
-    app.add_handler(CommandHandler("test_model", cmd_test_model))
-    app.add_handler(CommandHandler("test_all", cmd_test_all))
-    app.add_handler(CommandHandler("backup", cmd_backup))
-    app.add_handler(CommandHandler("backup_list", cmd_backup_list))
-    app.add_handler(CommandHandler("restore", cmd_restore))
-    app.add_handler(CommandHandler("enable", cmd_enable))
-    app.add_handler(CommandHandler("disable", cmd_disable))
-    app.add_handler(CommandHandler("disable_failed", cmd_disable_failed))
-    app.add_handler(CommandHandler("console", cmd_console))
-    app.add_handler(CommandHandler("today", cmd_today))
-    app.add_handler(CommandHandler("models", cmd_models))
-    app.add_handler(CommandHandler("users", cmd_users))
-    app.add_handler(CommandHandler("tokens", cmd_tokens))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("ai_config", cmd_ai_config))
-    app.add_handler(CommandHandler("ai_mode", cmd_ai_mode))
-    app.add_handler(CommandHandler("logs", cmd_logs))
-    app.add_handler(CommandHandler("diagnose", cmd_diagnose))
+    for name, _desc, handler in get_commands():
+        app.add_handler(CommandHandler(name, handler))
     # Agent 相关处理（必须在通用 callback_handler 之前注册）
     app.add_handler(CallbackQueryHandler(agent_callback_handler, pattern="^agent_confirm|^agent_cancel"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_agent_message))

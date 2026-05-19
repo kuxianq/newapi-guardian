@@ -50,6 +50,18 @@ def _store_pending_confirmation(tool: str, arguments: dict) -> str:
     return confirmation_id
 
 
+def _pop_pending_confirmation(confirmation_id: str, now: float | None = None) -> dict | None:
+    """Pop a pending confirmation only if it still exists and is not expired."""
+    now = now or time.time()
+    _cleanup_pending_confirmations(now)
+    pending = _pending_confirmations.pop(confirmation_id, None)
+    if not pending:
+        return None
+    if now - pending.get("created_at", 0) > PENDING_CONFIRMATION_TTL_SECONDS:
+        return None
+    return pending
+
+
 def get_agent(user_id: int) -> GuardianAgent:
     """获取或创建 Agent 实例"""
     if user_id not in _agent_cache:
@@ -209,7 +221,8 @@ async def _send_confirmation(update: Update, confirm_data: dict):
         f"⚠️ 操作需要确认\n\n"
         f"工具：`{tool}`\n"
         f"参数：`{arg_json[:200]}`\n"
-        f"原因：{reason}",
+        f"原因：{reason}\n"
+        f"确认有效期：`{PENDING_CONFIRMATION_TTL_SECONDS // 60} 分钟`",
         reply_markup=btn,
     )
 
@@ -228,7 +241,7 @@ async def agent_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         from tools_new.executor import execute_tool
 
         confirmation_id = data.removeprefix("agent_confirm:")
-        pending = _pending_confirmations.pop(confirmation_id, None)
+        pending = _pop_pending_confirmation(confirmation_id)
         if not pending:
             await safe_edit(query, "⚠️ 确认已过期或不存在，请重新发起操作。")
             return

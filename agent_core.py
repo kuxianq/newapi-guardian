@@ -36,7 +36,8 @@ import json
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional
+
+from agent_memory_sanitize import compact_turn_metadata
 
 logger = logging.getLogger("guardian.agent")
 
@@ -102,7 +103,7 @@ class AgentMemory:
             "timestamp": datetime.now().isoformat(),
             "user": user_msg,
             "assistant": assistant_msg,
-            "metadata": metadata or {}
+            "metadata": compact_turn_metadata(metadata or {})
         }
         self.working_memory.append(turn)
         self.short_term.append(turn)

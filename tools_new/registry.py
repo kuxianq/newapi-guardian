@@ -104,6 +104,35 @@ CORE_TOOLS = [
         "permission": "safe"
     },
     {
+        "name": "get_usage_summary",
+        "description": "确定性查询 NewAPI token/额度/请求量统计。适合回答“总共用了多少 token”“今天消耗多少”“按模型/用户/Token 统计”等用量问题，优先于自由 SQL。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["today", "yesterday", "all", "last_hours"],
+                    "description": "统计范围，默认 today"
+                },
+                "hours": {
+                    "type": "integer",
+                    "description": "scope=last_hours 时回看小时数，默认 24，最大 8760"
+                },
+                "group_by": {
+                    "type": "string",
+                    "enum": ["none", "model", "user", "token"],
+                    "description": "分组维度，默认 none"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "分组返回数量，默认 10，最大 50"
+                }
+            },
+            "additionalProperties": False
+        },
+        "permission": "safe"
+    },
+    {
         "name": "call_api",
         "description": "调用 NewAPI 后台 API。只读 GET 可直接执行；会修改状态的 POST/PUT/DELETE 或高风险端点需要确认。",
         "parameters": {

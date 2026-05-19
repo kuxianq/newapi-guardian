@@ -3,10 +3,9 @@ import logging
 import urllib.request
 import urllib.error
 import json
-import time
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from config import NEWAPI_BASE_URL, NEWAPI_ADMIN_TOKEN, NEWAPI_ADMIN_USER_ID
+from async_utils import run_many_blocking
 
 logger = logging.getLogger("guardian.api")
 
@@ -54,19 +53,13 @@ def test_channel(channel_id: int, model: str = "") -> dict:
 
 async def async_test_channels_batch(channel_ids: list[int], model: str = "", max_workers: int = 10) -> dict:
     """批量并发测试多个渠道（异步入口，供 Bot 事件循环内调用）。"""
-    loop = asyncio.get_running_loop()
-
     def _test(channel_id: int) -> dict:
         logger.info(f"Testing channel {channel_id}...")
         result = test_channel(channel_id, model)
         result["id"] = channel_id
         return result
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        results = await asyncio.gather(*[
-            loop.run_in_executor(executor, _test, channel_id)
-            for channel_id in channel_ids
-        ])
+    results = await run_many_blocking(channel_ids, _test, max_workers=max_workers)
 
     success_count = sum(1 for result in results if result.get("success"))
     return {

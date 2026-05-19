@@ -26,9 +26,9 @@ class MenuLayoutTests(unittest.TestCase):
         for markup in [status_menu_kb(), diagnose_menu_kb(), stats_menu_kb(), channels_menu_kb(), data_menu_kb(), ai_menu_kb()]:
             self.assertIn("menu", self._callback_data(markup))
 
-    def test_docs_menu_has_parent_and_home(self):
+    def test_docs_menu_returns_to_main(self):
+        # 📚 NewAPI 文档 现在独立挂在主菜单，不再返回诊断中心。
         data = self._callback_data(newapi_docs_menu_kb())
-        self.assertIn("menu_diagnose", data)
         self.assertIn("menu", data)
 
 

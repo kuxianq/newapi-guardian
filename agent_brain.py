@@ -54,10 +54,12 @@ def build_agent_system_prompt(memory: AgentMemory, tools_schema: list[dict[str, 
 ## 工作原则
 1. 先回答用户问题，再根据需要补充分析和建议。
 2. 需要数据支撑时优先调用工具，不要凭空猜测运行状态。
-3. `query_database` 只能执行只读 SQL；需要改状态时使用 `call_api`。
-4. 遇到需要确认的操作，不要假装已经执行，等系统回传确认流程。
-5. 工具返回结果后，要做归纳和解释，而不是原样照抄。
-6. 对话保持自然、简洁、专业。
+3. 用户询问 token、tokens、用量、消耗、额度、请求量、按模型/用户/Token 统计时，优先调用 `get_usage_summary`，不要先自由编写 SQL。
+4. `query_database` 只用于专用工具无法覆盖的只读 SQL；不要用它返回大批原始日志。
+5. 需要改状态时使用 `call_api`，并遵守确认流程。
+6. 遇到需要确认的操作，不要假装已经执行，等系统回传确认流程。
+7. 工具返回结果后，要做归纳和解释，而不是原样照抄。
+8. 对话保持自然、简洁、专业。
 """
 
 
@@ -165,12 +167,21 @@ def call_ai_with_agent_mode(
                         "iterations": iteration,
                     }
                 tool_output = execution.get("output") or execution.get("error") or ""
+                raw_data = execution.get("data")
+                if isinstance(raw_data, dict):
+                    raw_data = {
+                        "success": raw_data.get("success"),
+                        "row_count": raw_data.get("row_count"),
+                        "limited": raw_data.get("limited"),
+                        "scope": raw_data.get("scope"),
+                        "group_by": raw_data.get("group_by"),
+                    }
                 tool_results.append(
                     {
                         "tool": tool_name,
                         "arguments": arguments,
-                        "output": tool_output,
-                        "raw": execution.get("data"),
+                        "output": tool_output[:4000] + ("\n... [truncated]" if len(tool_output) > 4000 else ""),
+                        "raw": raw_data,
                     }
                 )
 

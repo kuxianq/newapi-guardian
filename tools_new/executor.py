@@ -8,6 +8,7 @@ from core.database import execute_readonly_sql
 from core.diagnostics import diagnose_failure_scope
 from core.http_client import call_api
 from core.newapi_version import detect_newapi_version
+from core.usage_summary import get_usage_summary
 from skills.newapi import get_newapi_docs
 from tools_new.formatter import format_tool_output
 from tools_new.registry import get_registry
@@ -65,6 +66,13 @@ class ToolExecutor:
                 raw = detect_newapi_version()
             elif tool_name == "get_newapi_docs":
                 raw = get_newapi_docs(arguments.get("topic"))
+            elif tool_name == "get_usage_summary":
+                raw = get_usage_summary(
+                    scope=str(arguments.get("scope", "today")),
+                    hours=arguments.get("hours"),
+                    group_by=str(arguments.get("group_by", "none")),
+                    limit=int(arguments.get("limit", 10)),
+                )
             elif tool_name == "call_api":
                 raw = call_api(
                     method=str(arguments.get("method", "GET")).upper(),

@@ -22,6 +22,8 @@ def format_tool_output(tool_name: str, raw: dict[str, Any]) -> str:
         return _format_newapi_runtime_info(raw)
     if tool_name == "get_newapi_docs":
         return _format_newapi_docs(raw)
+    if tool_name == "get_usage_summary":
+        return _format_usage_summary(raw)
     if tool_name == "call_api":
         return _format_call_api(raw)
 
@@ -141,6 +143,39 @@ def _format_newapi_docs(raw: dict[str, Any]) -> str:
         parts.append(f"\n{item.get('title', key)}")
         for note in item.get("notes", []):
             parts.append(f"- {note}")
+    return "\n".join(parts)
+
+
+def _format_usage_summary(raw: dict[str, Any]) -> str:
+    totals = raw.get("totals") or {}
+    prompt = int(totals.get("total_prompt_tokens") or 0)
+    completion = int(totals.get("total_completion_tokens") or 0)
+    total_tokens = int(totals.get("total_tokens") or (prompt + completion))
+    quota = float(totals.get("total_quota") or 0)
+    dollars = quota / 500000
+    scope = raw.get("scope", "today")
+    parts = [
+        "📊 NewAPI 用量统计",
+        f"范围: {scope}",
+        f"请求数: {int(totals.get('total_calls') or 0):,}",
+        f"总 Tokens: {total_tokens:,}",
+        f"Prompt: {prompt:,}",
+        f"Completion: {completion:,}",
+        f"额度消耗: ${dollars:.4f}",
+    ]
+    groups = raw.get("groups") or []
+    if groups:
+        group_by = raw.get("group_by") or "group"
+        parts.append(f"\nTop {group_by}:")
+        for idx, row in enumerate(groups[: int(raw.get("limit") or 10)], 1):
+            row_prompt = int(row.get("prompt_tokens") or 0)
+            row_completion = int(row.get("completion_tokens") or 0)
+            row_total = int(row.get("total_tokens") or (row_prompt + row_completion))
+            row_quota = float(row.get("quota") or 0) / 500000
+            parts.append(
+                f"{idx}. {truncate(str(row.get('name') or '未知'), 32)}｜"
+                f"{row_total:,} tokens｜{int(row.get('calls') or 0):,} 次｜${row_quota:.4f}"
+            )
     return "\n".join(parts)
 
 

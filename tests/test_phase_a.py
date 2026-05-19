@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
+from agent_memory_sanitize import compact_turn_metadata
 import agent_handler
 import newapi_client
 
@@ -45,6 +46,19 @@ class PhaseAStabilityTests(unittest.TestCase):
         self.assertEqual(result["total"], 2)
         self.assertEqual(result["success_count"], 2)
         self.assertEqual([item["id"] for item in result["results"]], [3, 4])
+
+    def test_agent_memory_metadata_is_sanitized_before_save(self):
+        metadata = {
+            "tool_results": [
+                {"tool": "query_database", "output": "x" * 9000, "raw": {"rows": [1]}}
+            ]
+        }
+        sanitized = compact_turn_metadata(metadata)
+        result = sanitized["tool_results"][0]
+        self.assertNotIn("raw", result)
+        self.assertTrue(result["raw_omitted"])
+        self.assertTrue(result["output_truncated"])
+        self.assertLess(len(result["output"]), 5000)
 
 
 if __name__ == "__main__":
